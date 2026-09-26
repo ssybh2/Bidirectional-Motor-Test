@@ -4,8 +4,8 @@ package_name = 'bidirectional_motor_test'
 
 setup(
     name=package_name,
-    version='0.1.0',
-    packages=find_packages(exclude=['test']),
+    version='0.2.0',
+    packages=find_packages(exclude=['tests', 'test']),
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
@@ -16,7 +16,7 @@ setup(
     zip_safe=True,
     maintainer='ssybh2',
     maintainer_email='ssybh2@users.noreply.github.com',
-    description='Safe DJI RC to bidirectional DSHOT600 bridge for EtherCAT motor bench testing.',
+    description='DJI RC gated sinusoidal DSHOT600 reversal and thrust timing.',
     license='MIT',
     entry_points={
         'console_scripts': [
