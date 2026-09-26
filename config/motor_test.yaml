@@ -1,8 +1,8 @@
 bidirectional_motor_test:
   ros__parameters:
-    # EcatV2_Master topics
-    input_topic: "/DJIRC"
-    output_topic: "/dshot600"
+    # EcatV2_Master topics for slave sn2555957
+    input_topic: "/ecat/sn2555957/app1/read"
+    output_topic: "/ecat/sn2555957/app2/write"
 
     # DSHOT channel connected to the ESC (1..4)
     motor_channel: 1
