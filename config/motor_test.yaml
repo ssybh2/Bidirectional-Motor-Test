@@ -1,0 +1,37 @@
+bidirectional_motor_test:
+  ros__parameters:
+    # EcatV2_Master topics
+    input_topic: "/DJIRC"
+    output_topic: "/dshot600"
+
+    # DSHOT channel connected to the ESC (1..4)
+    motor_channel: 1
+
+    # Direct DSHOT 3D/bidirectional ranges:
+    #   low range  = 48..1047
+    #   high range = 1048..2047
+    #
+    # Conservative bench-test defaults:
+    forward_idle_dshot: 1100
+    forward_max_dshot: 1300
+    reverse_idle_dshot: 100
+    reverse_max_dshot: 300
+
+    # If the physical motor direction is opposite to your expected
+    # "forward"/"reverse" labels, set this to true.
+    invert_direction: false
+
+    # false: switch 3/1 commands only the corresponding idle speed.
+    # true : positive movement of throttle_axis increases speed.
+    use_throttle_axis: false
+    throttle_axis: "left_y"
+    throttle_invert: false
+    throttle_deadband: 0.05
+    throttle_expo: 1.0
+
+    # Safety
+    direction_change_pause_sec: 1.0
+    rc_timeout_sec: 0.25
+    require_disarm_before_arm: true
+
+    publish_rate_hz: 50.0
