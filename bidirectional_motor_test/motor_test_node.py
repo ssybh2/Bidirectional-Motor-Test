@@ -185,9 +185,7 @@ class BidirectionalMotorTest(Node):
 
         age_sec = (now_ns - self.last_rc_ns) / 1e9
         if age_sec > self.rc_timeout_sec:
-            self._on_link_fault(
-                f'RC timeout ({age_sec:.3f}s > {self.rc_timeout_sec:.3f}s)'
-            )
+            self._on_link_fault('RC timeout -> DISARM')
             return
 
         if self.latest_rc.online != 1:
@@ -231,11 +229,7 @@ class BidirectionalMotorTest(Node):
 
             zero_elapsed_sec = (now_ns - self.zero_since_ns) / 1e9
             if zero_elapsed_sec < self.direction_pause_sec:
-                remaining = self.direction_pause_sec - zero_elapsed_sec
-                self._publish_dshot(
-                    0,
-                    f'direction-change pause ({remaining:.2f}s remaining)',
-                )
+                self._publish_dshot(0, 'direction-change pause')
                 return
 
         command = self._command_for_mode(desired_mode, self.latest_rc)
