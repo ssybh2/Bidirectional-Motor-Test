@@ -275,7 +275,8 @@ class NodeTickTests(unittest.TestCase):
         node.command_pub = types.SimpleNamespace(
             publish=lambda msg: published.append(json.loads(msg.data)))
         node.logs = types.SimpleNamespace(
-            write=lambda kind, **row: events.append((kind, row)))
+            write=lambda record_type, **row:
+            events.append((record_type, row)))
         # make_node stubs _log_event for other tests; call production method.
         self.module.BidirectionalMotorTest._log_event(
             node, "force_response_reference", mode="SINE",
