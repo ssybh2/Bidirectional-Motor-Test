@@ -54,7 +54,13 @@ class RawWindowRecorder:
             if sample_ns >= task["end_ns"]:
                 self._complete(event_id)
 
-    def trigger(self, event_id, command_ns):
+    def trigger(self, event_id, command_ns, post_sec=None):
+        # Reversal sign confirmation may take seconds, beyond the default
+        # short 0.75 s onset window. Extend ONLY a marked reversal event.
+        post_ns = (self.post_ns if post_sec is None else
+                   round(float(post_sec) * 1e9))
+        if not 0 < post_ns <= 10_000_000_000:
+            raise ValueError("raw event post_sec must be in (0, 10]")
         if self.active:
             # An overlapping event is still supported, but bounded to two.
             if len(self.active) >= 2:
@@ -65,7 +71,7 @@ class RawWindowRecorder:
         start_ns = command_ns - self.pre_ns
         # Copy BOTH sides of t0 from the ring: a late reference used to
         # silently omit already-buffered post-command samples.
-        end_ns = command_ns + self.post_ns
+        end_ns = command_ns + post_ns
         rows = [s for s in self.ring if start_ns <= s[0] <= end_ns]
         self.active[event_id] = dict(
             command_ns=command_ns, start_ns=start_ns,

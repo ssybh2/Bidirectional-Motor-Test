@@ -5,6 +5,7 @@ Hardware, real DDS, UDP startup and physical timing are NOT covered.
 """
 
 import importlib
+import json
 from collections import deque
 import queue
 import sys
@@ -249,6 +250,45 @@ class NodeTickTests(unittest.TestCase):
         node._drain_g10()
         self.assertEqual(node.g10_zero_count, 40)
         self.assertAlmostEqual(node.g10_zero_raw, 32767.5)
+
+    def test_first_opposite_dshot_t0_is_not_zero_or_first_start(self):
+        node = self.make_node()
+        events = []
+        node.wave.step = lambda now, rpm_ready: types.SimpleNamespace(
+            dshot=49, sine=-.1, direction=-1, phase_rad=3.18,
+            event="reversal_command")
+        node._log_event = lambda kind, **kwargs: events.append((kind, kwargs))
+        node._tick()
+        self.assertEqual(node.published, [49])
+        references = [row for kind, row in events if
+                      kind == "force_response_reference"]
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0]["reversal_from"], 1)
+        self.assertEqual(references[0]["direction"], -1)
+        self.assertEqual(references[0]["dshot"], 49)
+        self.assertIn("now_ns", references[0])
+
+    def test_actual_reference_relay_preserves_transition_metadata(self):
+        node = self.make_node()
+        published = []
+        events = []
+        node.command_pub = types.SimpleNamespace(
+            publish=lambda msg: published.append(json.loads(msg.data)))
+        node.logs = types.SimpleNamespace(
+            write=lambda kind, **row: events.append((kind, row)))
+        # make_node stubs _log_event for other tests; call production method.
+        self.module.BidirectionalMotorTest._log_event(
+            node, "force_response_reference", mode="SINE",
+            dshot=49, sine=-.1, now_ns=123456789,
+            direction=-1, reversal_from=1, event_id=8,
+            detail="EXTERNAL_G10: collector computes latency")
+        self.assertEqual(len(published), 1)
+        msg = published[0]
+        self.assertTrue(msg["reversal"])
+        self.assertEqual(msg["from_direction"], 1)
+        self.assertEqual(msg["direction"], -1)
+        self.assertEqual(msg["mono_ns"], 123456789)
+        self.assertIn("reversal_from=1", events[0][1]["detail"])
 
     def test_udp_event_starts_real_latency_tracker(self):
         node = self.make_node()

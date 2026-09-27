@@ -153,6 +153,11 @@ class BidirectionalMotorTest(Node):
         self.g10_capture_raw_events = bool(p["g10_capture_raw_events"])
         self.g10_raw_pre_sec = float(p["g10_raw_pre_sec"])
         self.g10_raw_post_sec = float(p["g10_raw_post_sec"])
+        # Retain native ADC through the latest possible sustained sign
+        # confirmation; a reversal often happens AFTER the 0.75 s
+        # onset-only raw window.
+        self.reversal_raw_post_sec = max(
+            self.g10_raw_post_sec, float(p["force_latency_timeout_sec"]))
         self.rpm_topic = str(p["rpm_topic"])
         self.require_rpm = bool(p["require_rpm_for_reversal"])
         rate = float(p["publish_rate_hz"])
@@ -541,7 +546,14 @@ class BidirectionalMotorTest(Node):
                 self.event_id += 1
                 eid = self.event_id
                 if self.raw_capture is not None and not (
-                        self.raw_capture.trigger(eid, stamp)):
+                        self.raw_capture.trigger(
+                            eid, stamp,
+                            post_sec=(
+                                self.reversal_raw_post_sec
+                                if (event.get("reversal") is True and
+                                    int(event.get("from_direction", 0)) ==
+                                    -direction)
+                                else None))):
                     self.get_logger().warn(
                         "G10 native event buffer full: %d" % eid)
                 baseline = None
