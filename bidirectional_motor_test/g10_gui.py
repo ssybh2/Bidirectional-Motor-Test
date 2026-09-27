@@ -67,8 +67,8 @@ class Dashboard:
         self.root = root
         root.title("G10 · Ubuntu 推力测量")
         root.configure(bg=ROOT)
-        root.geometry("1300x820")
-        root.minsize(1010, 660)
+        root.geometry("1300x840")
+        root.minsize(1010, 740)
         self.prefix = None
         self.last_mono = -1
         self.last_unit = None
@@ -109,8 +109,13 @@ class Dashboard:
             **kwargs)
 
     def _build(self):
-        header = tk.Frame(self.root, bg=ROOT, padx=24, pady=18)
-        header.pack(fill="x")
+        # Reserve header/metrics/controls/footer rows in the root grid.
+        # The chart is the only flexible row; recording controls must never
+        # disappear below a fixed-size 820 px window.
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(2, weight=1)
+        header = tk.Frame(self.root, bg=ROOT, padx=24, pady=9)
+        header.grid(row=0, column=0, sticky="ew")
         left = tk.Frame(header, bg=ROOT)
         left.pack(side="left")
         self._txt(left, "G10   /   实时推力测量", 23, bold=True).pack(
@@ -122,7 +127,7 @@ class Dashboard:
         self.connection.pack(side="right", padx=4)
 
         metrics = tk.Frame(self.root, bg=ROOT, padx=20)
-        metrics.pack(fill="x")
+        metrics.grid(row=1, column=0, sticky="ew")
         for column in range(4):
             metrics.grid_columnconfigure(
                 column, weight=1, uniform="metrics")
@@ -133,7 +138,7 @@ class Dashboard:
             ("采集状态", self.stream_value, self.age_value),
         ]
         for col, (label, var, detail) in enumerate(cards):
-            frame = tk.Frame(metrics, bg=SURFACE, padx=20, pady=15,
+            frame = tk.Frame(metrics, bg=SURFACE, padx=20, pady=10,
                              highlightbackground=EDGE, highlightthickness=1)
             frame.grid(row=0, column=col, sticky="ew", padx=5)
             self._txt(frame, label, 10, MUTED).pack(anchor="w")
@@ -162,8 +167,8 @@ class Dashboard:
                 else:
                     self._txt(frame, detail, 10, MUTED).pack(anchor="w")
 
-        work = tk.Frame(self.root, bg=ROOT, padx=24, pady=18)
-        work.pack(fill="both", expand=True)
+        work = tk.Frame(self.root, bg=ROOT, padx=24, pady=7)
+        work.grid(row=2, column=0, sticky="nsew")
         work.grid_columnconfigure(0, weight=5)
         work.grid_columnconfigure(1, weight=2)
         work.grid_rowconfigure(0, weight=1)
@@ -192,24 +197,24 @@ class Dashboard:
         self._txt(channels, "G10 · 8 路原始 ADC", 15, bold=True).pack(
             anchor="w")
         self._txt(channels, "其余通道尚未映射到物理单位",
-                  10, MUTED).pack(anchor="w", pady=(4, 18))
+                  10, MUTED).pack(anchor="w", pady=(3, 8))
         table = tk.Frame(channels, bg=SURFACE)
         table.pack(fill="x")
         for column in range(2):
             table.grid_columnconfigure(column, weight=1, uniform="adc")
         for i, var in enumerate(self.channel_vars):
             cell = tk.Frame(
-                table, bg=PANEL, padx=11, pady=10,
+                table, bg=PANEL, padx=11, pady=6,
                 highlightbackground=CYAN if i == 6 else EDGE,
                 highlightthickness=1)
             cell.grid(row=i // 2, column=i % 2,
-                      padx=4, pady=5, sticky="ew")
+                      padx=4, pady=3, sticky="ew")
             name = "ADC 6 · 推力候选" if i == 6 else "ADC %d" % i
             self._txt(cell, name, 10, CYAN if i == 6 else MUTED).pack(
                 anchor="w")
             self._txt(cell, "", 14, INK, bold=True, textvariable=var).pack(
                 anchor="w", pady=(4, 0))
-        tk.Frame(channels, bg=SURFACE, height=13).pack()
+        tk.Frame(channels, bg=SURFACE, height=7).pack()
         self._txt(channels,
                   "原始 ADC 可跨越 ±32768；推力曲线按相对零点计算。"
                   "反向编码和实际受力仍需双向静态验证。",
@@ -217,9 +222,10 @@ class Dashboard:
                 anchor="w")
 
         controls = tk.Frame(
-            self.root, bg=SURFACE, padx=23, pady=13,
+            self.root, bg=SURFACE, padx=19, pady=8,
             highlightbackground=EDGE, highlightthickness=1)
-        controls.pack(fill="x", padx=24, pady=(0, 12))
+        controls.grid(row=3, column=0, sticky="ew",
+                      padx=24, pady=(0, 6))
         first = tk.Frame(controls, bg=SURFACE)
         first.pack(fill="x")
         self._txt(first, "测量与标定", 13, bold=True).pack(
@@ -243,7 +249,7 @@ class Dashboard:
         self.btn_calibrate = self._button(
             first, "砝码标定", self._calibrate, CYAN)
         record_bar = tk.Frame(controls, bg=SURFACE)
-        record_bar.pack(fill="x", pady=(12, 1))
+        record_bar.pack(fill="x", pady=(5, 0))
         self._txt(record_bar, "实验录制", 13, bold=True).pack(
             side="left", padx=(0, 12))
         self.btn_record_start = self._button(
@@ -262,7 +268,7 @@ class Dashboard:
             textvariable=self.record_latency).pack(side="right")
 
         folder_bar = tk.Frame(controls, bg=SURFACE)
-        folder_bar.pack(fill="x", pady=(5, 1))
+        folder_bar.pack(fill="x", pady=(1, 0))
         self._txt(folder_bar, "保存到：", 10, MUTED).pack(side="left")
         self._txt(folder_bar, "", 10, MUTED,
                   textvariable=self.record_folder_text,
@@ -271,16 +277,16 @@ class Dashboard:
             controls,
             "录制文件为一个 ZIP，内含原始 DSHOT/推力 CSV、"
             "时间轴、每次换向的延迟及测量说明；界面刷新不参与计时。",
-            10, MUTED, justify="left").pack(anchor="w", pady=(4, 0))
+            10, MUTED, justify="left").pack(anchor="w", pady=(2, 0))
         self._txt(
             controls,
             "GUI 仅显示/标定测量数据，不代替遥控器停机和独立硬件急停."
             " 去皮与标定要求 DSHOT=0、遥控器 DISARM、静态载荷。",
             10, MUTED, wraplength=1180, justify="left"
-        ).pack(anchor="w", pady=(9, 0))
+        ).pack(anchor="w", pady=(4, 0))
 
-        footer = tk.Frame(self.root, bg=ROOT, padx=24, pady=7)
-        footer.pack(fill="x")
+        footer = tk.Frame(self.root, bg=ROOT, padx=24, pady=3)
+        footer.grid(row=4, column=0, sticky="ew")
         self._txt(footer, "", 10, MUTED,
                   textvariable=self.status_note,
                   anchor="w", justify="left",
@@ -293,7 +299,7 @@ class Dashboard:
             bg=PANEL, fg=color, activebackground=EDGE,
             activeforeground=INK, relief="flat", bd=0,
             cursor="hand2", font=(FONT, 11, "bold"),
-            padx=12, pady=8)
+            padx=12, pady=5)
         b.pack(side="left", padx=4)
         return b
 
