@@ -28,6 +28,9 @@ class CaptureSeparationTests(unittest.TestCase):
             write=lambda record_type, **row: node.rows.append((record_type, row)),
             close=lambda: node.stopped.append("csv"))
         node.force_history = deque(maxlen=30000)
+        node.reversal_packet_history = deque(maxlen=3000)
+        node.reversal_detector = self.module.ReversalDirectionTracker(
+            sign_threshold=4, stable_sec=0.2, timeout_sec=5.0)
         node.force_max_age_ns = 250_000_000
         node.last_force = 0.0
         node.last_force_ns = None

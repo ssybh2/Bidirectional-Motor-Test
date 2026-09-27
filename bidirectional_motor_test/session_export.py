@@ -638,7 +638,7 @@ def export_recording(prefix, destination, start_ns, stop_ns,
                 "command_timestamp": "time.monotonic_ns() before ROS publish",
                 "G10_sample_timestamp": (
                     "Sequence-paced estimate using configured sample period; "
-                    "NOT a synchronized device timestamp. "
+                    "NOT a device hardware timestamp or synchronized clock. "
                     "force_direction_change uses causal UDP host receive "
                     "timestamps instead of future-dated sample estimates"),
                 "force_unit": (
