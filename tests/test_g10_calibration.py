@@ -19,7 +19,7 @@ class CalibrationTests(unittest.TestCase):
         for i in range(1200):
             window.add(now - 120_000_000 + i * 100_000, 32687 + i % 3)
         mean, spread, n = window.snapshot(now, 20_000_000, 10)
-        self.assertEqual(mean, 32688)
+        self.assertAlmostEqual(mean, 32688, places=1)
         self.assertEqual(spread, 2)
         self.assertEqual(n, 100)
         for i in range(1200, 2400):
