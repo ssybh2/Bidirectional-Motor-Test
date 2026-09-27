@@ -426,6 +426,10 @@ class BidirectionalMotorTest(Node):
                 self.last_remote_command_rx_ns = now
                 self.last_command = value
                 self.last_mode = mode
+                # Cancel incomplete response estimates if RC disarms/stops.
+                # Stopping G10 capture itself never publishes DSHOT.
+                if mode != "SINE":
+                    self.latency.cancel()
                 self.logs.write(
                     "command", wall_ns=int(event["wall_ns"]),
                     mono_ns=stamp, mode=mode, channel=int(event["channel"]),
