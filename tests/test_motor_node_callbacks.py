@@ -32,6 +32,8 @@ def _load_node_without_ros():
     replacements["rclpy.qos"].qos_profile_sensor_data = object()
     replacements["std_msgs"].__path__ = []
     replacements["std_msgs.msg"].Float64 = type("Float64", (), {})
+    replacements["std_msgs.msg"].String = type("String", (), {
+        "__init__": lambda self, data="": setattr(self, "data", data)})
     replacements["custom_msgs"].__path__ = []
     replacements["custom_msgs.msg"].ReadDJIRC = type("ReadDJIRC", (), {})
     replacements["custom_msgs.msg"].WriteDSHOT = type("WriteDSHOT", (), {})
@@ -48,6 +50,7 @@ class NodeTickTests(unittest.TestCase):
 
     def make_node(self):
         node = object.__new__(self.module.BidirectionalMotorTest)
+        node.acquisition_only = False
         node.g10_enabled = True
         node.g10_adc_modulo = True
         node.g10_require_healthy = True
