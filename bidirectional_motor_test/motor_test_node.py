@@ -189,6 +189,7 @@ class BidirectionalMotorTest(Node):
         self.g10_last_sequence = None
         self.g10_sequence_gaps = 0
         self.g10_error_reported = False
+        self.g10_raw_error_reported = False
         self.g10_last_received_ns = None
         self.g10_last_dropped = 0
         self.g10_last_quality_ns = 0
@@ -326,11 +327,12 @@ class BidirectionalMotorTest(Node):
                 diff = self.g10.dropped_packets - self.g10_last_dropped
                 self.g10_last_dropped = self.g10.dropped_packets
                 self._on_g10_data_fault("UDP queue dropped %d packet(s)" % diff)
-            if self.raw_capture is not None and self.raw_capture.error is not None:
+            if (self.raw_capture is not None and
+                    self.raw_capture.error is not None and
+                    not self.g10_raw_error_reported):
+                self.g10_raw_error_reported = True
                 self._on_g10_data_fault(
                     "raw CSV writer error: %s" % self.raw_capture.error)
-                # Do not flood logs on every polling cycle.
-                self.raw_capture.error = None
             self._log_g10_quality()
         except Exception as exc:
             self._on_g10_data_fault("G10 processing exception: %s" % exc)
@@ -364,12 +366,18 @@ class BidirectionalMotorTest(Node):
         zero_ready = (
             not self.g10_auto_zero or
             self.g10_zero_count >= self.g10_auto_zero_samples)
-        return g10_health(
+        recorder_error = (
+            self.raw_capture.error if self.raw_capture is not None else None)
+        ready, reason = g10_health(
             now_ns=now, last_recv_ns=self.g10_last_received_ns,
             zero_ready=zero_ready, timeout_ns=self.g10_no_packet_timeout_ns,
             backlog=self.g10.packets.qsize(),
             backlog_limit=self.g10_max_queue_backlog,
-            error=self.g10.error)
+            error=self.g10.error or recorder_error)
+        if ready and (self.last_force_ns is None or
+                      now - self.last_force_ns > self.force_max_age_ns):
+            return False, "force_samples_stale"
+        return ready, reason
 
     def _drain_g10(self):
         if self.g10 is None:
