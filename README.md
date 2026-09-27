@@ -8,7 +8,7 @@
 |---|---|---|
 | DJI RC 输入 | `/ecat/sn2555957/app1/read` | `custom_msgs/msg/ReadDJIRC` |
 | DSHOT 输出 | `/ecat/sn2555957/app2/write` | `custom_msgs/msg/WriteDSHOT` |
-| 可选推力数据 | 默认**未连接**；由用户指定 `force_topic` | `std_msgs/msg/Float64` |
+| 推力数据 | **本分支默认启用 G10 UDP 直接采集**；可选关闭并改为 `force_topic` | ADC 原始计数 / 可选 `std_msgs/msg/Float64` |
 | 可选转速数据 | 默认**未连接**；由用户指定 `rpm_topic` | `std_msgs/msg/Float64` |
 
 默认 DSHOT 输出为 `channel1`；其他 channel 始终写入 0。上面两个 EtherCAT 话题已与从站 `sn2555957` 对齐。
@@ -54,11 +54,13 @@ rpm_stable_sec: 0.3
 
 ## 指令到推力变化：到底量了什么
 
-节点每个控制周期记录：
+节点每个控制周期记录（并由独立的、有限批次的 G10 接收定时器处理 UDP）：
 
 - `command.csv`：ROS 调用 publish 时的单调时钟时间、实际 DSHOT 指令、带符号的正弦量和模式。
 - `force.csv`：推力 ROS 消息**抵达本节点**的单调时钟时间、数值和当时最新的 DSHOT。
 - `event.csv`：解锁、正弦启动、换向等待以及**相反方向第一条非零命令**的时刻；每个测试事件分配 `event_id`。
+- `g10_quality.csv`：每秒记录有效/无效包、队列丢包、估计时间倒退、包序号异常、最新收包年龄和自动归零进度。
+- `test_*_raw_event_XXXX.csv`：每次首条正向/反向非零命令的前后完整原始采样窗口，后台写盘；不包含虚构的丢失采样。
 - `latency.csv`：每个 `event_id` 的两个指标：`force_onset`（推力向目标方向变化超过阈值），`target_sign`（推力达到目标符号及阈值）。需要连续 `force_confirm_samples` 个样本满足条件；记录的是第一个满足条件的样本时间。
 
 事件的 **t₀** 是 `first_command` / `reversal_command` 的首次非零 DSHOT 发布时刻，**不是**正弦过零、也不是开始强制等待的时刻。由此不会把人工设定的 `reversal_pause_sec` 直接算进“指令→推力”延迟。
@@ -89,7 +91,7 @@ t2 = 连续达到目标符号阈值的第一条推力样本时刻
 
 在这台 SN `DET50316-62-50307-1` 上，从零开始编号的 `g10_adc_channel: 6`（线上第 7 路 ADC）对轻压推力传感器的响应远大于其他通道，暂定为推力原始通道。节点直接在同一 Ubuntu 进程内给 UDP 批次重建 100 µs 样本时刻，并与 DSHOT publish 的 `time.monotonic_ns()` 比较，因此不再需要同步 Windows 时钟。
 
-默认配置已经启用直接接收：
+默认配置已经启用直接接收，并增加了数据健康联锁：
 
 ```yaml
 force_topic: ""
@@ -99,6 +101,11 @@ g10_auto_zero: true
 g10_auto_zero_samples: 10000
 g10_force_sign: -1
 g10_kgf_per_count: 0.0
+g10_require_healthy: true
+g10_no_packet_timeout_sec: 0.15
+g10_capture_raw_events: true
+g10_raw_pre_sec: 0.25
+g10_raw_post_sec: 0.75
 ```
 
 `g10_kgf_per_count: 0.0` 表示先用 `raw_count` 测量。启动前让台架完全卸载，节点用最初 1 秒的 10000 点自动归零。此模式的建议初始阈值为 50 counts、连续 10 点（1 ms）。接着放置已知质量 `M_kg` 的砝码，记录稳定后的 `raw_loaded` 和零点 `raw_zero`：
@@ -130,7 +137,9 @@ force_forward_sign: 1
 
 ```bash
 cd /home/hby/bidirectional/Bidirectional-Motor-Test
-git pull --ff-only origin main
+git fetch origin
+git switch g10-linux-udp
+git pull --ff-only origin g10-linux-udp
 
 cd /home/hby/bidirectional
 source /opt/ros/humble/setup.bash
@@ -164,6 +173,38 @@ ros2 topic echo /ecat/sn2555957/app2/write
 ls -lt ~/bidirectional/measurements | head -12
 ```
 
+## Ubuntu G10 UDP 首次部署：先验证收包，不要直接通电转桨
+
+**必须使用两块独立物理网卡：EtherCAT 保持原专用网口，G10 接 Ubuntu 的另一块网卡。** 将命令中的 `<G10网卡名>` 替换为 `ip -br link` 查到的实际名称，务必不要改到 EtherCAT 网卡：
+
+```bash
+ip -br link
+sudo ip address add 192.168.127.55/24 dev <G10网卡名>
+sudo ip link set <G10网卡名> up
+
+# 不需要 ROS，无桨、ESC 动力断开时就可完成。
+cd ~/bidirectional/Bidirectional-Motor-Test
+python3 -m bidirectional_motor_test.g10_probe --bind 192.168.127.55 --seconds 15
+```
+
+若确实收到经过校验的 G10 UDP，探针打印解码包数、包序号异常及每路 ADC 的 min/max。**探针不会发送任何启动或握手命令。** 如果打印 `NO DATA`，这不证明协议解析一定有误；也可能是厂家 Windows 软件启动时发送了初始化/订阅控制包。需要从 Windows 软件打开、连接到首包输出的完整双向 `.pcapng` 中分析，不能凭空拼装初始化指令。
+
+探针与 ROS 节点**不能同时**绑定 UDP 4800；探针退出后才启动：
+
+```bash
+cd ~/bidirectional
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-up-to bidirectional_motor_test
+source install/setup.bash
+ros2 launch bidirectional_motor_test motor_test.launch.py
+```
+
+确认日志出现 `G10 auto-zero complete`，并且台架空载/轻微施加已知静载时 `force.csv` 的方向、数据量有意义，之后再考虑命令测试。没有数据、自动归零未完成、收包超时、队列积压或包序号不连续时，默认 `g10_require_healthy: true` 会输出 0 并要求重新 **2 → 3 → 1**。若**仅在完全断开 ESC 动力的 ROS 联调**中不希望等待 G10，可暂时设置 `g10_require_healthy: false`；实测务必改回 `true`。
+
+新增的采样窗口默认为首条反向非零 DSHOT 前 0.25 秒、后 0.75 秒，保存全部解码的约 10 kHz 样本（即使连续 `force.csv` 为每 40 点取 1 点）。`g10_quality.csv` 记录实际队列与丢包情况；任何显著时钟重叠、未标定 UDP 接收时延、设备 ADC 滤波延迟，都不能仅凭 0.1 ms 名义采样间隔消除。
+
+**注意：接到同一主机只解决 Windows/Ubuntu 的独立时钟基准问题。** `g10_udp.py` 假设最新样本接近 UDP `recvfrom` 返回时刻，把前 39 个样本以 100 µs 间隔往回推。这是估算，不是设备硬件时间戳。厂家缓存、网络和 Linux 任务调度都能把估计的推力变化时刻移位。数据健康校验和完整采样窗口提高可信度，仍然需要硬件同步验证毫秒/亚毫秒级响应精度。
+
 ## 关键硬件安全限制
 
 **不要将软件 DISARM 当作断电保证。** 在当前 EcatV2_Master / H750 软件路径中，若只有本 ROS 控制节点退出、EtherCAT master 仍运行，从站可能继续接收到/保持最后的非零 DSHOT。节点的退出清零属于 best-effort，不能覆盖进程崩溃、系统卡死和线路失效。必须有独立、可立即切断 ESC 动力的物理急停。
@@ -183,7 +224,11 @@ sdowrite_init_value: !uint16_t 0
 
 - `bidirectional_motor_test/core.py`：开关解锁状态机与正弦 DSHOT 映射，含停机保持。
 - `bidirectional_motor_test/latency.py`：推力变化 / 推力换向的阈值判定。
-- `bidirectional_motor_test/g10_udp.py`：G10 986-byte UDP 帧解析、10 kHz 样本时间重建和接收线程。
+- `bidirectional_motor_test/g10_udp.py`：G10 986-byte UDP 帧解析、样本时间估计和接收线程。
+- `bidirectional_motor_test/g10_health.py`：数据就绪 / 推力基准时间判断。
+- `bidirectional_motor_test/raw_capture.py`：换向事件原生采样缓存与异步 CSV 写盘。
+- `bidirectional_motor_test/g10_probe.py`：纯接收 UDP 诊断工具（无发包或初始化）。
+- `tests/test_motor_node_callbacks.py`：不依赖 ROS 的真实控制回调 mock 回归测试。
 - `bidirectional_motor_test/motor_test_node.py`：ROS 话题、接收回调、定时发布和 CSV。
 - `tests/test_control.py`：纯 Python 单元测试，无需连接电机。
 

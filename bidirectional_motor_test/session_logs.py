@@ -26,6 +26,12 @@ class SessionLogs:
             "latency": ("event_id", "metric", "status", "command_mono_ns",
                         "observed_mono_ns", "latency_ms", "baseline_force",
                         "observed_force", "force_unit"),
+            "g10_quality": ("mono_ns", "wall_ns", "stream_ready", "reason",
+                            "last_receive_age_ms", "decoded_packets",
+                            "invalid_packets", "queue_dropped",
+                            "sequence_gap_events", "timestamp_regressions",
+                            "queue_backlog", "zero_samples",
+                            "raw_windows_dropped"),
         }
         for kind, columns in schemas.items():
             handle = open(str(prefix) + "_" + kind + ".csv",
@@ -40,7 +46,7 @@ class SessionLogs:
         self.writers[record_type].writerow(row)
         # We prefer durable, immediately inspectable measurements over disk speed
         # at the default 50 Hz command rate.
-        self.handles[("command", "force", "event", "latency").index(record_type)].flush()
+        self.handles[("command", "force", "event", "latency", "g10_quality").index(record_type)].flush()
 
     def close(self):
         for handle in self.handles:

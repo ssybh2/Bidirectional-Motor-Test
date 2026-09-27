@@ -55,6 +55,21 @@ bidirectional_motor_test:
     g10_zero_raw: 0.0
     g10_force_sign: -1
     g10_kgf_per_count: 0.0   # 0 measures raw_count; set after calibration
-    g10_log_decimation: 40   # log 250 Hz, detect onset on all 10 kHz samples
+    g10_log_decimation: 40   # continuous force.csv ~250 Hz, event window native 10 kHz
+    # Ubuntu UDP stream health: block sine output until a calibrated/raw
+    # fresh G10 stream is available, including auto-zero completion.
+    # Set false ONLY for non-powered/no-prop command-path debugging.
+    g10_require_healthy: true
+    g10_no_packet_timeout_sec: 0.15
+    g10_poll_rate_hz: 100.0
+    g10_max_packets_per_poll: 6
+    g10_max_queue_backlog: 24
+
+    # Keep full-rate raw samples only around each first/reverse command.
+    # Each window is written on a background thread after its post-history.
+    g10_capture_raw_events: true
+    g10_raw_pre_sec: 0.25
+    g10_raw_post_sec: 0.75
+
 
     log_directory: "~/bidirectional/measurements"

@@ -15,7 +15,9 @@ from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 
 from .core import SineDshot, SwitchInterlock
 from .g10_udp import G10UDPReceiver
+from .g10_health import baseline_ready, g10_health
 from .latency import ThrustLatency
+from .raw_capture import RawWindowRecorder
 from .session_logs import SessionLogs
 
 
@@ -61,6 +63,14 @@ class BidirectionalMotorTest(Node):
             "g10_force_sign": -1,
             "g10_kgf_per_count": 0.0,
             "g10_log_decimation": 40,
+            "g10_require_healthy": True,
+            "g10_no_packet_timeout_sec": 0.15,
+            "g10_poll_rate_hz": 100.0,
+            "g10_max_packets_per_poll": 6,
+            "g10_max_queue_backlog": 24,
+            "g10_capture_raw_events": True,
+            "g10_raw_pre_sec": 0.25,
+            "g10_raw_post_sec": 0.75,
             "log_directory": "~/bidirectional/measurements",
         }
         for key, value in defaults.items():
@@ -88,6 +98,15 @@ class BidirectionalMotorTest(Node):
         self.g10_force_sign = int(p["g10_force_sign"])
         self.g10_kgf_per_count = float(p["g10_kgf_per_count"])
         self.g10_log_decimation = int(p["g10_log_decimation"])
+        self.g10_require_healthy = bool(p["g10_require_healthy"])
+        self.g10_no_packet_timeout_ns = round(
+            float(p["g10_no_packet_timeout_sec"]) * 1e9)
+        self.g10_poll_rate_hz = float(p["g10_poll_rate_hz"])
+        self.g10_max_packets_per_poll = int(p["g10_max_packets_per_poll"])
+        self.g10_max_queue_backlog = int(p["g10_max_queue_backlog"])
+        self.g10_capture_raw_events = bool(p["g10_capture_raw_events"])
+        self.g10_raw_pre_sec = float(p["g10_raw_pre_sec"])
+        self.g10_raw_post_sec = float(p["g10_raw_post_sec"])
         self.rpm_topic = str(p["rpm_topic"])
         self.require_rpm = bool(p["require_rpm_for_reversal"])
         rate = float(p["publish_rate_hz"])
@@ -117,6 +136,12 @@ class BidirectionalMotorTest(Node):
             raise ValueError("g10_force_sign must be +1 or -1")
         if self.g10_kgf_per_count < 0 or self.g10_log_decimation < 1:
             raise ValueError("G10 scale must be >= 0 and log decimation >= 1")
+        if self.g10_no_packet_timeout_ns <= 0 or self.g10_poll_rate_hz <= 0:
+            raise ValueError("G10 timeout and processing rate must be > 0")
+        if self.g10_max_packets_per_poll < 1 or self.g10_max_queue_backlog < 1:
+            raise ValueError("G10 processing and backlog limits must be > 0")
+        if self.g10_raw_pre_sec < 0 or self.g10_raw_post_sec <= 0:
+            raise ValueError("G10 raw event windows must be nonnegative/positive")
         if self.require_rpm and not self.rpm_topic:
             raise ValueError("require_rpm_for_reversal needs a nonempty rpm_topic")
 
@@ -140,6 +165,11 @@ class BidirectionalMotorTest(Node):
         )
         self.interlock = SwitchInterlock()
         self.logs = SessionLogs(str(p["log_directory"]), self.force_unit)
+        self.raw_capture = (
+            RawWindowRecorder(
+                self.logs.prefix, self.g10_sample_period_ns,
+                self.g10_raw_pre_sec, self.g10_raw_post_sec)
+            if self.g10_enabled and self.g10_capture_raw_events else None)
 
         self.rc = None
         self.rc_received_ns = None
@@ -159,6 +189,11 @@ class BidirectionalMotorTest(Node):
         self.g10_last_sequence = None
         self.g10_sequence_gaps = 0
         self.g10_error_reported = False
+        self.g10_last_received_ns = None
+        self.g10_last_dropped = 0
+        self.g10_last_quality_ns = 0
+        self.g10_last_unready = None
+        self.g10_timestamp_regressions = 0
 
         self.publisher = self.create_publisher(
             WriteDSHOT, str(p["output_topic"]), qos_profile_sensor_data)
@@ -183,6 +218,12 @@ class BidirectionalMotorTest(Node):
                 expected_device_ip=str(p["g10_device_ip"]),
             )
             self.g10.start()
+            # Never exhaust the UDP queue in the 50 Hz DSHOT timer:
+            # one bounded polling callback handles at most N UDP batches.
+            self.g10_timer = self.create_timer(
+                1.0 / self.g10_poll_rate_hz, self._g10_poll)
+        else:
+            self.g10_timer = None
 
         self.timer = self.create_timer(1.0 / rate, self._tick)
         self._publish(0, "STARTUP", 0.0, 0, 0.0)
@@ -245,6 +286,11 @@ class BidirectionalMotorTest(Node):
         self._accept_force(now, force, signed_force, log_sample=True)
 
     def _accept_force(self, now, raw_force, signed_force, log_sample):
+        # UDP batches are host-arrival anchored; receive jitter may produce
+        # overlapping sample estimates. Do not feed backward time into latency.
+        if self.last_force_ns is not None and now <= self.last_force_ns:
+            self.g10_timestamp_regressions += 1
+            return
         self.last_force = signed_force
         self.last_force_ns = now
         if log_sample:
@@ -256,22 +302,92 @@ class BidirectionalMotorTest(Node):
         for result in self.latency.observe(now, signed_force):
             self._log_result(result)
 
+    def _on_g10_data_fault(self, reason):
+        """Immediately command zero and revoke arm authorization."""
+        self.interlock.fault()
+        self.latency.cancel()
+        if self.wave.running:
+            self.last_wave_stopped_ns = time.monotonic_ns()
+        self.wave.stop()
+        self._log_event("g10_data_fault", mode="G10_UNREADY",
+                        detail=reason)
+        self.get_logger().warn("G10 data fault: %s; output DSHOT 0" % reason)
+        self._publish(0, "G10_FAULT", 0.0, 0, 0.0)
+
+    def _g10_poll(self):
+        if self.g10 is None:
+            return
+        try:
+            self._drain_g10()
+            if self.g10.error is not None and not self.g10_error_reported:
+                self.g10_error_reported = True
+                self._on_g10_data_fault("receiver_error: %s" % self.g10.error)
+            if self.g10.dropped_packets > self.g10_last_dropped:
+                diff = self.g10.dropped_packets - self.g10_last_dropped
+                self.g10_last_dropped = self.g10.dropped_packets
+                self._on_g10_data_fault("UDP queue dropped %d packet(s)" % diff)
+            if self.raw_capture is not None and self.raw_capture.error is not None:
+                self._on_g10_data_fault(
+                    "raw CSV writer error: %s" % self.raw_capture.error)
+                # Do not flood logs on every polling cycle.
+                self.raw_capture.error = None
+            self._log_g10_quality()
+        except Exception as exc:
+            self._on_g10_data_fault("G10 processing exception: %s" % exc)
+
+    def _log_g10_quality(self):
+        now = time.monotonic_ns()
+        if now - self.g10_last_quality_ns < 1_000_000_000:
+            return
+        self.g10_last_quality_ns = now
+        ready, reason = self._g10_status(now)
+        age_ms = (
+            (now - self.g10_last_received_ns) / 1e6
+            if self.g10_last_received_ns is not None else "")
+        self.logs.write(
+            "g10_quality", mono_ns=now, wall_ns=time.time_ns(),
+            stream_ready=int(ready), reason=reason,
+            last_receive_age_ms=age_ms,
+            decoded_packets=self.g10.received_packets,
+            invalid_packets=self.g10.invalid_packets,
+            queue_dropped=self.g10.dropped_packets,
+            sequence_gap_events=self.g10_sequence_gaps,
+            timestamp_regressions=self.g10_timestamp_regressions,
+            queue_backlog=self.g10.packets.qsize(),
+            zero_samples=self.g10_zero_count,
+            raw_windows_dropped=(
+                self.raw_capture.dropped_windows if self.raw_capture else 0))
+
+    def _g10_status(self, now):
+        if self.g10 is None:
+            return True, "disabled"
+        zero_ready = (
+            not self.g10_auto_zero or
+            self.g10_zero_count >= self.g10_auto_zero_samples)
+        return g10_health(
+            now_ns=now, last_recv_ns=self.g10_last_received_ns,
+            zero_ready=zero_ready, timeout_ns=self.g10_no_packet_timeout_ns,
+            backlog=self.g10.packets.qsize(),
+            backlog_limit=self.g10_max_queue_backlog,
+            error=self.g10.error)
+
     def _drain_g10(self):
         if self.g10 is None:
             return
-        if self.g10.error is not None and not self.g10_error_reported:
-            self.g10_error_reported = True
-            self.get_logger().error("G10 receiver stopped: %s" % self.g10.error)
-        while True:
+        for _ in range(self.g10_max_packets_per_poll):
             try:
                 received_ns, packet = self.g10.packets.get_nowait()
             except queue.Empty:
                 break
+            self.g10_last_received_ns = received_ns
 
             if self.g10_last_sequence is not None:
                 expected = (self.g10_last_sequence + 1) & 0xFFFF
                 if packet.sequence != expected:
-                    self.g10_sequence_gaps += (packet.sequence - expected) & 0xFFFF
+                    self.g10_sequence_gaps += 1
+                    self._on_g10_data_fault(
+                        "UDP sequence gap %d -> %d" %
+                        (self.g10_last_sequence, packet.sequence))
             self.g10_last_sequence = packet.sequence
             timestamps = packet.sample_timestamps(
                 received_ns, self.g10_sample_period_ns,
@@ -293,6 +409,10 @@ class BidirectionalMotorTest(Node):
                          if self.g10_kgf_per_count > 0 else 1.0)
                 force = self.g10_force_sign * (raw - self.g10_zero_raw) * scale
                 self.g10_sample_count += 1
+                if self.raw_capture is not None:
+                    self.raw_capture.add(
+                        sample_ns, received_ns, packet.sequence,
+                        raw, force, self.force_unit)
                 self._accept_force(
                     sample_ns, raw, force,
                     log_sample=(self.g10_sample_count %
@@ -312,8 +432,11 @@ class BidirectionalMotorTest(Node):
             force_unit=self.force_unit)
         if result.latency_ms is not None:
             self.get_logger().info(
-                "event %d %s: %.3f ms (ROS publish -> force receipt, %s)" %
+                "event %d %s: %.3f ms (%s, %s)" %
                 (result.event_id, result.metric, result.latency_ms,
+                 "ROS publish -> estimated G10 sample (uncalibrated bias)"
+                 if self.g10_enabled else
+                 "ROS publish -> force ROS message receipt",
                  self.force_unit))
 
     def _publish(self, value, mode, sine, direction, phase):
@@ -335,7 +458,8 @@ class BidirectionalMotorTest(Node):
         return send_ns
 
     def _tick(self):
-        self._drain_g10()
+        # The UDP decoder is on a separate, bounded timer. This callback
+        # must keep publishing DSHOT 0 even when the G10 is not streaming.
         now = time.monotonic_ns()
         for result in self.latency.expire(now):
             self._log_result(result)
@@ -348,6 +472,16 @@ class BidirectionalMotorTest(Node):
         elif int(self.rc.online) != 1:
             self.interlock.fault()
             mode = "RC_OFFLINE"
+        elif self.g10_enabled and self.g10_require_healthy:
+            ready, reason = self._g10_status(now)
+            if not ready:
+                if reason != self.g10_last_unready:
+                    self._on_g10_data_fault(reason)
+                    self.g10_last_unready = reason
+                mode = "G10_UNREADY_" + reason.upper()
+            else:
+                self.g10_last_unready = None
+                mode = self.interlock.mode(int(self.rc.right_switch))
         else:
             mode = self.interlock.mode(int(self.rc.right_switch))
 
@@ -391,10 +525,17 @@ class BidirectionalMotorTest(Node):
         if wave.event in ("first_command", "reversal_command"):
             self.event_id += 1
             event_id = self.event_id
-            baseline_available = (
-                self.force_topic and self.last_force_ns is not None and
-                0 <= send_ns - self.last_force_ns <= self.force_max_age_ns)
-            baseline = self.last_force if baseline_available else None
+            zero_ready = (
+                not self.g10_enabled or not self.g10_auto_zero or
+                self.g10_zero_count >= self.g10_auto_zero_samples)
+            valid = baseline_ready(
+                self.g10_enabled, self.force_topic, zero_ready,
+                self.last_force_ns, send_ns, self.force_max_age_ns)
+            baseline = self.last_force if valid else None
+            if self.raw_capture is not None:
+                if not self.raw_capture.trigger(event_id, send_ns):
+                    self.get_logger().warn(
+                        "G10 raw event buffer full for event %d" % event_id)
             self._log_event(
                 "force_response_reference", mode=mode, dshot=wave.dshot,
                 sine=wave.sine, event_id=event_id, now_ns=send_ns,
@@ -414,7 +555,8 @@ class BidirectionalMotorTest(Node):
     def shutdown(self):
         if self.g10 is not None:
             self.g10.stop()
-            self._drain_g10()
+        if self.raw_capture is not None:
+            self.raw_capture.close()
         self.wave.stop()
         # Best-effort only: a crash, OS hang, DDS loss, or slave-side latch
         # can retain the last command. A separate hardware stop is necessary.

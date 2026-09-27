@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'motor_test = bidirectional_motor_test.motor_test_node:main',
+            'g10_probe = bidirectional_motor_test.g10_probe:main',
         ],
     },
 )

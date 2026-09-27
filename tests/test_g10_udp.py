@@ -1,9 +1,11 @@
+import queue
+import socket
 import struct
 import unittest
 
 from bidirectional_motor_test.g10_udp import (
     DATA_PREFIX, DATA_SUFFIX, G10ProtocolError, HEADER_SIZE, PAYLOAD_SIZE,
-    RECORD_SIZE, SAMPLE_COUNT, decode_g10_payload,
+    RECORD_SIZE, SAMPLE_COUNT, G10UDPReceiver, decode_g10_payload,
 )
 
 
@@ -47,6 +49,25 @@ class DecoderTests(unittest.TestCase):
             with self.subTest(length=len(payload)):
                 with self.assertRaises(G10ProtocolError):
                     decode_g10_payload(payload)
+
+    def test_real_localhost_udp_receiver_roundtrip(self):
+        receiver = G10UDPReceiver(
+            bind_host="127.0.0.1", port=0,
+            expected_device_ip="127.0.0.1", queue_size=4)
+        port = receiver._socket.getsockname()[1]
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.start()
+        try:
+            sender.sendto(make_packet(0x4D00), ("127.0.0.1", port))
+            recv_ns, decoded = receiver.packets.get(timeout=2.0)
+            self.assertGreater(recv_ns, 0)
+            self.assertEqual(decoded.sequence, 0x4D00)
+            self.assertEqual(decoded.samples[0][6], -994)
+            self.assertEqual(receiver.received_packets, 1)
+            self.assertEqual(receiver.invalid_packets, 0)
+        finally:
+            receiver.stop()
+            sender.close()
 
     def test_validates_timestamp_arguments(self):
         packet = decode_g10_payload(make_packet())
