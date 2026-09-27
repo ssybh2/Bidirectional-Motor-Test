@@ -64,6 +64,7 @@ class NodeTickTests(unittest.TestCase):
         node.last_force_ns = time.monotonic_ns() - 1_000_000
         node.force_max_age_ns = 250_000_000
         node.force_topic = ""  # This was the real regression.
+        node.force_unit = "raw_count"
         node.last_mode = "SINE"
         node.last_wave_stopped_ns = None
         node.event_id = 0
