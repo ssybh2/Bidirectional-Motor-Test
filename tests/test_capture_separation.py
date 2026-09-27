@@ -20,7 +20,7 @@ class CaptureSeparationTests(unittest.TestCase):
         node.acquisition_only = True
         node.rows, node.stopped = [], []
         node.logs = types.SimpleNamespace(
-            write=lambda kind, **row: node.rows.append((kind, row)),
+            write=lambda record_type, **row: node.rows.append((record_type, row)),
             close=lambda: node.stopped.append("csv"))
         node.force_history = deque(maxlen=30000)
         node.force_max_age_ns = 250_000_000
