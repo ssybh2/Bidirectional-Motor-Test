@@ -139,6 +139,7 @@ class NodeTickTests(unittest.TestCase):
 
     def test_tare_refused_when_motor_is_armed_or_active(self):
         node = self.make_node()
+        node.g10 = types.SimpleNamespace(error=None)
         node.last_mode = "ARMED"
         node.last_command = 0
         node.wave.running = False
