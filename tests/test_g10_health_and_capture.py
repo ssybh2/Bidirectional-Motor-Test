@@ -35,6 +35,51 @@ class HealthTests(unittest.TestCase):
 
 
 class RawCaptureTests(unittest.TestCase):
+    def test_late_metadata_backfills_post_command_samples(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = RawWindowRecorder(
+                str(Path(d) / "late"), sample_period_ns=100_000,
+                pre_sec=0.0003, post_sec=0.0005)
+            try:
+                for i in range(15):
+                    rec.add(i * 100_000, i * 100_000 + 20_000,
+                            17 + i // 4, i, i + 1, "count")
+                self.assertTrue(rec.trigger(1, 700_000))
+                # The post-window was entirely buffered before trigger.
+            finally:
+                rec.close()
+            with Path(str(Path(d) / "late") +
+                      "_raw_event_0001.csv").open(newline="") as stream:
+                samples = list(csv.DictReader(stream))
+            self.assertEqual(
+                [int(x["estimated_sample_mono_ns"]) for x in samples],
+                list(range(400_000, 1_200_000 + 1, 100_000)))
+            self.assertEqual(rec.saved_windows, 1)
+            self.assertIsNone(rec.error)
+
+    def test_delayed_reference_backfills_partial_post_and_new_arrivals(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = RawWindowRecorder(
+                str(Path(d) / "partial"), sample_period_ns=100_000,
+                pre_sec=0.0002, post_sec=0.0005)
+            try:
+                for i in range(10):
+                    rec.add(i * 100_000, i * 100_000, i,
+                            i, i, "count")
+                self.assertTrue(rec.trigger(1, 700_000))
+                for i in range(10, 14):
+                    rec.add(i * 100_000, i * 100_000, i,
+                            i, i, "count")
+            finally:
+                rec.close()
+            with Path(str(Path(d) / "partial") +
+                      "_raw_event_0001.csv").open(newline="") as stream:
+                samples = list(csv.DictReader(stream))
+            self.assertEqual(
+                [int(x["estimated_sample_mono_ns"]) for x in samples],
+                list(range(500_000, 1_200_000 + 1, 100_000)))
+            self.assertIsNone(rec.error)
+
     def test_reconstruction_contains_pre_and_post_and_actual_sequence(self):
         with tempfile.TemporaryDirectory() as d:
             rec = RawWindowRecorder(

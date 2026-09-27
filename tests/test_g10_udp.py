@@ -5,7 +5,8 @@ import unittest
 
 from bidirectional_motor_test.g10_udp import (
     DATA_PREFIX, DATA_SUFFIX, G10ProtocolError, HEADER_SIZE, PAYLOAD_SIZE,
-    RECORD_SIZE, SAMPLE_COUNT, G10UDPReceiver, decode_g10_payload,
+    RECORD_SIZE, SAMPLE_COUNT, G10UDPReceiver, G10SequenceClock,
+    decode_g10_payload,
 )
 
 
@@ -68,6 +69,36 @@ class DecoderTests(unittest.TestCase):
         finally:
             receiver.stop()
             sender.close()
+
+    def test_sequence_clock_handles_bursty_receipts_and_wraparound(self):
+        period = 100_993
+        clock = G10SequenceClock(period)
+        base = 10_000_000_000
+        latest = None
+        for i, jitter in enumerate((0, 900_000, -600_000, 800_000,
+                                     -500_000, 2_000_000)):
+            seq = (0xFFFC + i) & 0xFFFF
+            receive = base + i * 40 * period + jitter
+            times = clock.sample_timestamps(seq, receive)
+            self.assertEqual(len(times), 40)
+            self.assertEqual(times[-1] - times[0], 39 * period)
+            if latest is not None:
+                self.assertEqual(times[0] - latest, period)
+            latest = times[-1]
+        self.assertEqual(clock.rejected_sequence_packets, 0)
+        self.assertEqual(clock.receive_residual_ns, 2_000_000)
+        self.assertIsNone(clock.sample_timestamps(1, base))
+        self.assertIsNone(clock.sample_timestamps(0, base))
+        self.assertEqual(clock.rejected_sequence_packets, 2)
+
+    def test_sequence_gap_exposes_missing_time_not_synthetic_samples(self):
+        clock = G10SequenceClock(100_993)
+        first = clock.sample_timestamps(10, 10_000_000)
+        next_packet = clock.sample_timestamps(
+            13, 10_000_000 + 3 * 40 * 100_993)
+        self.assertEqual(
+            next_packet[0] - first[-1],
+            (3 * 40 - 39) * 100_993)
 
     def test_validates_timestamp_arguments(self):
         packet = decode_g10_payload(make_packet())

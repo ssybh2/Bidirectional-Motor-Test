@@ -170,6 +170,7 @@ class NodeTickTests(unittest.TestCase):
         node.g10_force_sign = -1
         node.g10_sample_period_ns = 100_000
         node.g10_arrival_bias_ns = 0
+        node.g10_clock = self.module.G10SequenceClock(100_000)
         node.g10_last_sequence = None
         node.g10_sequence_gaps = 0
         node.g10_max_packets_per_poll = 6
@@ -224,6 +225,7 @@ class NodeTickTests(unittest.TestCase):
         node.g10_zero_sum = 0.0
         node.g10_sample_period_ns = 100_000
         node.g10_arrival_bias_ns = 0
+        node.g10_clock = self.module.G10SequenceClock(100_000)
         node.g10_last_sequence = None
         node.g10_sequence_gaps = 0
         node.g10_max_packets_per_poll = 6

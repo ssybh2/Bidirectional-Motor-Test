@@ -306,6 +306,32 @@ class RecordingExportTests(unittest.TestCase):
             meta = json.loads(archive.read("metadata.json"))
             self.assertEqual(meta["g10_timebase_regressions"], 17)
 
+    def test_new_sequence_clock_drift_flag_preserves_raw_data(self):
+        self.write_command(200, 1100, 1)
+        self.write_force(201, 9)
+        for stamp, residual in ((150, 1.0), (250, 13.5)):
+            self.logs.write(
+                "g10_quality", mono_ns=stamp, wall_ns=3000 + stamp,
+                stream_ready=1, reason="ready", last_receive_age_ms=2,
+                decoded_packets=1, invalid_packets=0, queue_dropped=0,
+                sequence_gap_events=0, timestamp_regressions=0,
+                queue_backlog=0, zero_samples=10000,
+                raw_windows_dropped=0,
+                sequence_clock_residual_ms=residual,
+                sequence_clock_max_abs_residual_ms=residual,
+                sample_period_ns=100993)
+        result = export_recording(
+            self.logs.prefix, self.output, 100, 300,
+            started_wall_ns=1_790_495_000_000_000_000)
+        meta = result["metadata"]
+        self.assertEqual(meta["g10_timebase_regressions"], 0)
+        self.assertEqual(meta["g10_estimated_sample_period_ns"], 100993)
+        self.assertEqual(
+            meta["g10_sequence_clock_max_abs_residual_ms"], 13.5)
+        self.assertTrue(
+            any("residual" in warning for warning in result["warnings"]))
+        self.assertEqual(result["counts"]["force"], 1)
+
     def test_no_force_or_missing_folder_never_write_success_archive(self):
         self.write_command(200, 1100, 1)
         with self.assertRaisesRegex(ExportError, "No force samples"):

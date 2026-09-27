@@ -457,10 +457,10 @@ def export_recording(prefix, destination, start_ns, stop_ns,
                     raw_event_paths.append(target)
                 else:
                     raw_missing.append(event_id)
-            # Packet sample times are estimated independently from UDP
-            # receive timestamps. Jitter can make adjacent packet estimates
-            # overlap. Earlier samples discarded by the collector cannot
-            # be recreated from this ZIP or assumed to have 0 ms latency.
+            # Legacy G10 sessions independently anchored each packet at its
+            # UDP receive timestamp. New sessions use a sequence-paced
+            # estimated clock. Neither method is a synchronized device clock:
+            # missing samples cannot be recreated after recording.
             quality = list(_read_written(files["g10_quality"]))
             def counter_delta(field):
                 if len(quality) < 2:
@@ -473,6 +473,27 @@ def export_recording(prefix, destination, start_ns, stop_ns,
             timebase_regressions = counter_delta("timestamp_regressions")
             udp_queue_drops = counter_delta("queue_dropped")
             udp_sequence_gaps = counter_delta("sequence_gap_events")
+            def latest_quality_float(field):
+                if not quality:
+                    return None
+                try:
+                    value = float(quality[-1][field])
+                    return value if math.isfinite(value) else None
+                except (KeyError, ValueError, TypeError, OverflowError):
+                    return None
+
+            clock_max_residual_ms = latest_quality_float(
+                "sequence_clock_max_abs_residual_ms")
+            clock_sample_period_ns = latest_quality_float(
+                "sample_period_ns")
+            if (clock_max_residual_ms is not None and
+                    clock_max_residual_ms > 10.0):
+                warnings.append(
+                    "G10 sequence-clock/host-receive residual reached "
+                    "%.3f ms; estimated ADC timebase may drift or be "
+                    "biased by network scheduling. This is NOT a "
+                    "hardware-synchronized response delay." %
+                    clock_max_residual_ms)
             if timebase_regressions:
                 warnings.append(
                     "G10 estimated sample timestamps regressed %d times; "
@@ -503,6 +524,9 @@ def export_recording(prefix, destination, start_ns, stop_ns,
                 "g10_timebase_regressions": timebase_regressions,
                 "g10_udp_queue_drops": udp_queue_drops,
                 "g10_sequence_gap_events": udp_sequence_gaps,
+                "g10_sequence_clock_max_abs_residual_ms":
+                    clock_max_residual_ms,
+                "g10_estimated_sample_period_ns": clock_sample_period_ns,
                 "latency_status": (
                     "detected" if onset else
                     "not_measured" if not counts["latency"] else

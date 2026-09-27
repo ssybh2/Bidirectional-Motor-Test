@@ -20,12 +20,17 @@ class RawWindowRecorder:
                "force", "force_unit")
 
     def __init__(self, prefix, sample_period_ns, pre_sec=0.25,
-                 post_sec=0.75, max_pending=3):
-        if sample_period_ns <= 0 or pre_sec < 0 or post_sec <= 0:
+                 post_sec=0.75, max_pending=3, max_trigger_lag_sec=2.0):
+        if (sample_period_ns <= 0 or pre_sec < 0 or post_sec <= 0
+                or max_trigger_lag_sec < 0):
             raise ValueError("invalid raw capture sample period/windows")
         self.pre_ns = round(pre_sec * 1e9)
         self.post_ns = round(post_sec * 1e9)
-        n = max(40, int(self.pre_ns / sample_period_ns) + 80)
+        # ROS/CSV controller metadata can arrive up to 2 s late. Retain
+        # already-received post-event ADC as well as pre-event history.
+        lookback_ns = (self.pre_ns + self.post_ns +
+                       round(max_trigger_lag_sec * 1e9))
+        n = max(40, int(lookback_ns / sample_period_ns) + 80)
         self.ring = deque(maxlen=n)
         self.active = {}
         self.jobs = queue.Queue(maxsize=int(max_pending))
@@ -58,12 +63,15 @@ class RawWindowRecorder:
         event_id = int(event_id)
         command_ns = int(command_ns)
         start_ns = command_ns - self.pre_ns
-        # Include prehistory already received; next UDP batch may still bring
-        # several additional pre-event samples.
-        rows = [s for s in self.ring if start_ns <= s[0] <= command_ns]
+        # Copy BOTH sides of t0 from the ring: a late reference used to
+        # silently omit already-buffered post-command samples.
+        end_ns = command_ns + self.post_ns
+        rows = [s for s in self.ring if start_ns <= s[0] <= end_ns]
         self.active[event_id] = dict(
             command_ns=command_ns, start_ns=start_ns,
-            end_ns=command_ns + self.post_ns, rows=rows)
+            end_ns=end_ns, rows=rows)
+        if self.ring and self.ring[-1][0] >= end_ns:
+            self._complete(event_id)
         return True
 
     def _complete(self, event_id):

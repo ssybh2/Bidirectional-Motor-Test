@@ -28,7 +28,9 @@ SAMPLE_COUNT = 40
 ADC_CHANNEL_COUNT = 8
 RECORD_SIZE = 22
 PACKET_SEQUENCE_OFFSET = 972
-DEFAULT_SAMPLE_PERIOD_NS = 100_000
+# G10 trial 2026-09-27: 100993.4 ns/sample inferred from packet sequences.
+# Estimated rate, NOT an externally synchronized G10 hardware clock.
+DEFAULT_SAMPLE_PERIOD_NS = 100_993
 
 _RECORD = struct.Struct(">8h3H")
 _EXPECTED_MARKERS = (
@@ -57,6 +59,53 @@ class G10Packet:
         newest = int(received_ns) - int(arrival_bias_ns)
         oldest = newest - (SAMPLE_COUNT - 1) * int(sample_period_ns)
         return tuple(oldest + i * int(sample_period_ns)
+                     for i in range(SAMPLE_COUNT))
+
+
+class G10SequenceClock:
+    """Sequence-paced estimated sampling clock, not a device timestamp.
+
+    A fresh per-packet receive-time anchor can move backwards on UDP jitter,
+    discarding otherwise intact ADC samples. Anchor once, then advance by
+    packet sequence and a calibrated period. Never synthesize missing packets.
+    The receive-time residual exposes drift and scheduling jitter.
+    """
+
+    def __init__(self, sample_period_ns=DEFAULT_SAMPLE_PERIOD_NS,
+                 arrival_bias_ns=0):
+        self.sample_period_ns = int(sample_period_ns)
+        self.arrival_bias_ns = int(arrival_bias_ns)
+        if self.sample_period_ns <= 0 or self.arrival_bias_ns < 0:
+            raise ValueError("sample period must be positive; arrival bias >= 0")
+        self.last_sequence = None
+        self.last_newest_ns = None
+        self.receive_residual_ns = 0
+        self.max_abs_receive_residual_ns = 0
+        self.rejected_sequence_packets = 0
+
+    def sample_timestamps(self, sequence, received_ns):
+        """Forty ordered estimated times, or None on duplicate/old packet."""
+        sequence = int(sequence) & 0xFFFF
+        received_ns = int(received_ns)
+        arrival_newest = received_ns - self.arrival_bias_ns
+        if self.last_sequence is None:
+            newest = arrival_newest
+        else:
+            step = (sequence - self.last_sequence) & 0xFFFF
+            if step == 0 or step > 0x7FFF:
+                self.rejected_sequence_packets += 1
+                return None
+            newest = (
+                self.last_newest_ns +
+                step * SAMPLE_COUNT * self.sample_period_ns)
+        self.last_sequence = sequence
+        self.last_newest_ns = newest
+        self.receive_residual_ns = arrival_newest - newest
+        self.max_abs_receive_residual_ns = max(
+            self.max_abs_receive_residual_ns,
+            abs(self.receive_residual_ns))
+        oldest = newest - (SAMPLE_COUNT - 1) * self.sample_period_ns
+        return tuple(oldest + i * self.sample_period_ns
                      for i in range(SAMPLE_COUNT))
 
 

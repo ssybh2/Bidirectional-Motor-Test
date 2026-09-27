@@ -20,7 +20,7 @@ from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 
 from .core import SineDshot, SwitchInterlock
 from .control_recovery import recent_control_metadata
-from .g10_udp import G10UDPReceiver
+from .g10_udp import G10UDPReceiver, G10SequenceClock
 from .g10_calibration import (
     CalibrationError, StableADCWindow, adc_delta, load_scale, save_scale,
     scale_for_known_mass, wrap_signed16,
@@ -67,7 +67,7 @@ class BidirectionalMotorTest(Node):
             "g10_udp_port": 4800,
             "g10_device_ip": "192.168.127.56",
             "g10_adc_channel": 6,
-            "g10_sample_period_ns": 100000,
+            "g10_sample_period_ns": 100993,
             "g10_arrival_bias_ns": 0,
             "g10_auto_zero": True,
             "g10_auto_zero_samples": 10000,
@@ -280,6 +280,10 @@ class BidirectionalMotorTest(Node):
         self.last_wave_stopped_ns = None
         self.event_id = 0
         self.g10 = None
+        self.g10_clock = (
+            G10SequenceClock(
+                self.g10_sample_period_ns, self.g10_arrival_bias_ns)
+            if self.g10_enabled else None)
         self.g10_zero_sum = 0.0
         self.g10_zero_reference = None
         self.g10_zero_count = 0
@@ -644,6 +648,11 @@ class BidirectionalMotorTest(Node):
             queue_dropped=self.g10.dropped_packets,
             sequence_gap_events=self.g10_sequence_gaps,
             timestamp_regressions=self.g10_timestamp_regressions,
+            sequence_clock_residual_ms=round(
+                self.g10_clock.receive_residual_ns / 1e6, 4),
+            sequence_clock_max_abs_residual_ms=round(
+                self.g10_clock.max_abs_receive_residual_ns / 1e6, 4),
+            sample_period_ns=self.g10_sample_period_ns,
             queue_backlog=self.g10.packets.qsize(),
             metadata_source=self.metadata_source,
             command_age_ms=(
@@ -683,6 +692,14 @@ class BidirectionalMotorTest(Node):
             except queue.Empty:
                 break
             self.g10_last_received_ns = received_ns
+            timestamps = self.g10_clock.sample_timestamps(
+                packet.sequence, received_ns)
+            if timestamps is None:
+                self.g10_sequence_gaps += 1
+                self._on_g10_data_fault(
+                    "duplicate or out-of-order G10 sequence %d" %
+                    packet.sequence)
+                continue
 
             if self.g10_last_sequence is not None:
                 expected = (self.g10_last_sequence + 1) & 0xFFFF
@@ -692,9 +709,6 @@ class BidirectionalMotorTest(Node):
                         "UDP sequence gap %d -> %d" %
                         (self.g10_last_sequence, packet.sequence))
             self.g10_last_sequence = packet.sequence
-            timestamps = packet.sample_timestamps(
-                received_ns, self.g10_sample_period_ns,
-                self.g10_arrival_bias_ns)
             self.g10_packet_count += 1
             if (self.g10_packet_count %
                     self.g10_channel_log_decimation == 0):
