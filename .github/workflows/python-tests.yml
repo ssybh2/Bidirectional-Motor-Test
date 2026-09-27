@@ -48,3 +48,6 @@ jobs:
           xvfb-run -a env G10_GUI_SMOKE_TEST=1 bash scripts/launch_g10_desktop.sh
           grep -q 'GUI exited normally' "$XDG_STATE_HOME/bidirectional-g10/dashboard-launch.log"
           echo 'G10 desktop .sh startup: passed (ROS not sourced)'
+      - name: Exercise GUI record and ZIP export buttons
+        run: |
+          xvfb-run -a env PYTHONPATH=. /usr/bin/python3 tests/smoke_record_gui.py
