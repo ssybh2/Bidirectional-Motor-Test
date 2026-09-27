@@ -33,9 +33,28 @@ bidirectional_motor_test:
     force_unit: "kgf"
     force_forward_sign: 1
     force_sample_max_age_sec: 0.25
-    force_change_threshold: 0.03
-    force_sign_threshold: 0.03
-    force_confirm_samples: 3
+    # Direct G10 raw-count defaults below use 50 counts and 10 samples (1 ms).
+    # After kgf calibration, typical starting values are 0.03 kgf and 3 samples.
+    force_change_threshold: 50.0
+    force_sign_threshold: 50.0
+    force_confirm_samples: 10
     force_latency_timeout_sec: 5.0
+
+    # Reverse-engineered DET G10X.322 Ethernet stream. The Ubuntu G10 NIC must
+    # be 192.168.127.55/24; the test bench sends from 192.168.127.56:5000 to
+    # UDP port 4800. Use a second NIC -- never share the EtherCAT NIC.
+    g10_udp_enabled: true
+    g10_bind_host: "0.0.0.0"
+    g10_udp_port: 4800
+    g10_device_ip: "192.168.127.56"
+    g10_adc_channel: 6       # zero-based: wire ADC 7 is thrust on this G10
+    g10_sample_period_ns: 100000
+    g10_arrival_bias_ns: 0   # keep zero until measured with a hardware trigger
+    g10_auto_zero: true
+    g10_auto_zero_samples: 10000  # 1 s; bench must be unloaded at startup
+    g10_zero_raw: 0.0
+    g10_force_sign: -1
+    g10_kgf_per_count: 0.0   # 0 measures raw_count; set after calibration
+    g10_log_decimation: 40   # log 250 Hz, detect onset on all 10 kHz samples
 
     log_directory: "~/bidirectional/measurements"

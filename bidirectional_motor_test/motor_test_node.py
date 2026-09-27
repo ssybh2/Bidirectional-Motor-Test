@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import queue
 import time
 
 import rclpy
@@ -13,6 +14,7 @@ from std_msgs.msg import Float64
 from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 
 from .core import SineDshot, SwitchInterlock
+from .g10_udp import G10UDPReceiver
 from .latency import ThrustLatency
 from .session_logs import SessionLogs
 
@@ -46,6 +48,19 @@ class BidirectionalMotorTest(Node):
             "force_sign_threshold": 0.03,
             "force_confirm_samples": 3,
             "force_latency_timeout_sec": 5.0,
+            "g10_udp_enabled": False,
+            "g10_bind_host": "0.0.0.0",
+            "g10_udp_port": 4800,
+            "g10_device_ip": "192.168.127.56",
+            "g10_adc_channel": 6,
+            "g10_sample_period_ns": 100000,
+            "g10_arrival_bias_ns": 0,
+            "g10_auto_zero": True,
+            "g10_auto_zero_samples": 10000,
+            "g10_zero_raw": 0.0,
+            "g10_force_sign": -1,
+            "g10_kgf_per_count": 0.0,
+            "g10_log_decimation": 40,
             "log_directory": "~/bidirectional/measurements",
         }
         for key, value in defaults.items():
@@ -63,6 +78,16 @@ class BidirectionalMotorTest(Node):
         self.force_forward_sign = int(p["force_forward_sign"])
         self.force_unit = str(p["force_unit"])
         self.force_topic = str(p["force_topic"])
+        self.g10_enabled = bool(p["g10_udp_enabled"])
+        self.g10_adc_channel = int(p["g10_adc_channel"])
+        self.g10_sample_period_ns = int(p["g10_sample_period_ns"])
+        self.g10_arrival_bias_ns = int(p["g10_arrival_bias_ns"])
+        self.g10_auto_zero = bool(p["g10_auto_zero"])
+        self.g10_auto_zero_samples = int(p["g10_auto_zero_samples"])
+        self.g10_zero_raw = float(p["g10_zero_raw"])
+        self.g10_force_sign = int(p["g10_force_sign"])
+        self.g10_kgf_per_count = float(p["g10_kgf_per_count"])
+        self.g10_log_decimation = int(p["g10_log_decimation"])
         self.rpm_topic = str(p["rpm_topic"])
         self.require_rpm = bool(p["require_rpm_for_reversal"])
         rate = float(p["publish_rate_hz"])
@@ -80,8 +105,24 @@ class BidirectionalMotorTest(Node):
             raise ValueError("run_reentry_pause_sec must be >= 0")
         if self.force_forward_sign not in (-1, 1):
             raise ValueError("force_forward_sign must be +1 or -1")
+        if self.g10_enabled and self.force_topic:
+            raise ValueError("use either force_topic or direct G10 UDP, not both")
+        if self.g10_adc_channel not in range(8):
+            raise ValueError("g10_adc_channel must be in 0..7")
+        if self.g10_sample_period_ns <= 0 or self.g10_arrival_bias_ns < 0:
+            raise ValueError("G10 sample period must be positive; arrival bias >= 0")
+        if self.g10_auto_zero_samples < 1:
+            raise ValueError("g10_auto_zero_samples must be >= 1")
+        if self.g10_force_sign not in (-1, 1):
+            raise ValueError("g10_force_sign must be +1 or -1")
+        if self.g10_kgf_per_count < 0 or self.g10_log_decimation < 1:
+            raise ValueError("G10 scale must be >= 0 and log decimation >= 1")
         if self.require_rpm and not self.rpm_topic:
             raise ValueError("require_rpm_for_reversal needs a nonempty rpm_topic")
+
+        if self.g10_enabled:
+            self.force_unit = ("kgf" if self.g10_kgf_per_count > 0
+                               else "raw_count")
 
         self.wave = SineDshot(
             frequency_hz=float(p["sine_frequency_hz"]),
@@ -111,6 +152,13 @@ class BidirectionalMotorTest(Node):
         self.last_mode = None
         self.last_wave_stopped_ns = None
         self.event_id = 0
+        self.g10 = None
+        self.g10_zero_sum = 0.0
+        self.g10_zero_count = 0
+        self.g10_sample_count = 0
+        self.g10_last_sequence = None
+        self.g10_sequence_gaps = 0
+        self.g10_error_reported = False
 
         self.publisher = self.create_publisher(
             WriteDSHOT, str(p["output_topic"]), qos_profile_sensor_data)
@@ -128,6 +176,14 @@ class BidirectionalMotorTest(Node):
                 Float64, self.rpm_topic, self._on_rpm,
                 qos_profile_sensor_data)
 
+        if self.g10_enabled:
+            self.g10 = G10UDPReceiver(
+                bind_host=str(p["g10_bind_host"]),
+                port=int(p["g10_udp_port"]),
+                expected_device_ip=str(p["g10_device_ip"]),
+            )
+            self.g10.start()
+
         self.timer = self.create_timer(1.0 / rate, self._tick)
         self._publish(0, "STARTUP", 0.0, 0, 0.0)
         self.get_logger().info(
@@ -139,6 +195,12 @@ class BidirectionalMotorTest(Node):
             "3D ESC mode required. Switch 2=DISARM, 3=ARMED at zero output, "
             "1=SINE. No rotor-stop guarantee without RPM feedback. "
             "Never treat ROS alone as an emergency stop.")
+        if self.g10 is not None:
+            self.get_logger().info(
+                "direct G10 UDP enabled: %s:%d, ADC channel %d, %s" %
+                (p["g10_bind_host"], p["g10_udp_port"], self.g10_adc_channel,
+                 "auto-zeroing" if self.g10_auto_zero else
+                 "zero=%.3f" % self.g10_zero_raw))
 
     def _log_event(self, kind, mode="", dshot=0, sine=0.0, detail="",
                    event_id=0, now_ns=None):
@@ -180,14 +242,61 @@ class BidirectionalMotorTest(Node):
             return
         now = time.monotonic_ns()
         signed_force = force * self.force_forward_sign
+        self._accept_force(now, force, signed_force, log_sample=True)
+
+    def _accept_force(self, now, raw_force, signed_force, log_sample):
         self.last_force = signed_force
         self.last_force_ns = now
-        self.logs.write(
-            "force", wall_ns=time.time_ns(), mono_ns=now,
-            raw_force=force, forward_positive_force=signed_force,
-            force_unit=self.force_unit, last_dshot=self.last_command)
+        if log_sample:
+            wall_offset = time.time_ns() - time.monotonic_ns()
+            self.logs.write(
+                "force", wall_ns=now + wall_offset, mono_ns=now,
+                raw_force=raw_force, forward_positive_force=signed_force,
+                force_unit=self.force_unit, last_dshot=self.last_command)
         for result in self.latency.observe(now, signed_force):
             self._log_result(result)
+
+    def _drain_g10(self):
+        if self.g10 is None:
+            return
+        if self.g10.error is not None and not self.g10_error_reported:
+            self.g10_error_reported = True
+            self.get_logger().error("G10 receiver stopped: %s" % self.g10.error)
+        while True:
+            try:
+                received_ns, packet = self.g10.packets.get_nowait()
+            except queue.Empty:
+                break
+
+            if self.g10_last_sequence is not None:
+                expected = (self.g10_last_sequence + 1) & 0xFFFF
+                if packet.sequence != expected:
+                    self.g10_sequence_gaps += (packet.sequence - expected) & 0xFFFF
+            self.g10_last_sequence = packet.sequence
+            timestamps = packet.sample_timestamps(
+                received_ns, self.g10_sample_period_ns,
+                self.g10_arrival_bias_ns)
+            for sample_ns, channels in zip(timestamps, packet.samples):
+                raw = float(channels[self.g10_adc_channel])
+                if (self.g10_auto_zero and
+                        self.g10_zero_count < self.g10_auto_zero_samples):
+                    self.g10_zero_sum += raw
+                    self.g10_zero_count += 1
+                    if self.g10_zero_count == self.g10_auto_zero_samples:
+                        self.g10_zero_raw = (
+                            self.g10_zero_sum / self.g10_zero_count)
+                        self.get_logger().info(
+                            "G10 auto-zero complete: %.6f raw counts" %
+                            self.g10_zero_raw)
+                    continue
+                scale = (self.g10_kgf_per_count
+                         if self.g10_kgf_per_count > 0 else 1.0)
+                force = self.g10_force_sign * (raw - self.g10_zero_raw) * scale
+                self.g10_sample_count += 1
+                self._accept_force(
+                    sample_ns, raw, force,
+                    log_sample=(self.g10_sample_count %
+                                self.g10_log_decimation == 0))
 
     def _log_result(self, result):
         self.logs.write(
@@ -226,6 +335,7 @@ class BidirectionalMotorTest(Node):
         return send_ns
 
     def _tick(self):
+        self._drain_g10()
         now = time.monotonic_ns()
         for result in self.latency.expire(now):
             self._log_result(result)
@@ -302,6 +412,9 @@ class BidirectionalMotorTest(Node):
                     self._log_result(result)
 
     def shutdown(self):
+        if self.g10 is not None:
+            self.g10.stop()
+            self._drain_g10()
         self.wave.stop()
         # Best-effort only: a crash, OS hang, DDS loss, or slave-side latch
         # can retain the last command. A separate hardware stop is necessary.

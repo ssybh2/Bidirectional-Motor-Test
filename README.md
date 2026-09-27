@@ -65,30 +65,56 @@ rpm_stable_sec: 0.3
 
 ```text
 t0 = 首次反向非零 DSHOT publish（ROS 主机单调时钟）
-t1 = 满足显著变化判据的第一条推力消息抵达 ROS 主机
+t1 = 满足显著变化判据的第一条推力样本时刻
 推力变化观测延迟 = t1 - t0
 
-t2 = 连续达到目标符号阈值的第一条推力消息抵达时刻
+t2 = 连续达到目标符号阈值的第一条推力样本时刻
 推力换向观测延迟 = t2 - t0
 ```
 
-默认显著变化阈值为 `force_change_threshold: 0.03`；目标符号阈值为 `force_sign_threshold: 0.03`；连续确认样本数为 3。**阈值单位与发布推力的 ROS 话题一致。** 如果使用 N 而不是 kgf，请调整 `force_unit` 和阈值。必要时根据实测传感器噪声增大阈值；否则噪声或原方向的惯性衰减可能造成“变化开始”的误判。
+直接 G10 原始计数模式默认显著变化/符号阈值为 50 counts，连续确认 10 个原生样本（1 ms）；完成 kgf 标定后可从 0.03 kgf、3 点开始再按噪声调整。ROS 推力话题模式下，阈值单位与话题一致。否则噪声或原方向的惯性衰减可能造成“变化开始”的误判。
 
-这两个时间差是**ROS 指令发布到 ROS 推力接收的观测延迟**，包括 ROS 调度、EtherCAT、ESC、电机、推力传感器采集与传输等影响。不是纯 ESC 延迟，也不等价于硬件同步的真实力学延迟。ROS 默认发布频率 50 Hz 本身带来约 20 ms 的命令离散化，推力话题的采样率及传输延迟还会影响时间分辨率。只有共同时间基准或硬件同步才能进一步分解各环节。
+这两个时间差是**ROS 指令发布到推力变化的观测延迟**，包括 ROS 调度、EtherCAT、ESC、电机、推力传感器采集与传输等影响。不是纯 ESC 延迟，也不等价于硬件同步的真实力学延迟。ROS 默认发布频率 50 Hz 本身带来约 20 ms 的命令离散化；直接 G10 模式可保留 0.1 ms 的传感器样本间隔，但绝对时刻仍包含设备批处理及网络传输偏差。只有硬件触发才能进一步分解各环节。
 
 ### G10 推力数据接入条件
 
-目前你给出的 `EcatV2_Master` 配置**没有 G10 推力 ROS 话题**，本仓库也**没有擅自假设 G10 LAN 协议**。因此默认：
+现在已经根据 G10X.322.0.0.492 与 DET G10-10KGF-5 的实机抓包加入直接 UDP 接收。已确认的线格式是：
+
+```text
+192.168.127.56:5000 -> 192.168.127.55:4800/UDP
+986-byte payload = 10-byte header + 40 x 22-byte sample record
+                     + 4 x 22-byte status record + 8-byte trailer
+每个有效记录包含 8 路 signed big-endian int16 ADC；约 250 包/s，即标称每路 10 kHz。
+```
+
+在这台 SN `DET50316-62-50307-1` 上，从零开始编号的 `g10_adc_channel: 6`（线上第 7 路 ADC）对轻压推力传感器的响应远大于其他通道，暂定为推力原始通道。节点直接在同一 Ubuntu 进程内给 UDP 批次重建 100 µs 样本时刻，并与 DSHOT publish 的 `time.monotonic_ns()` 比较，因此不再需要同步 Windows 时钟。
+
+默认配置已经启用直接接收：
 
 ```yaml
 force_topic: ""
+g10_udp_enabled: true
+g10_adc_channel: 6
+g10_auto_zero: true
+g10_auto_zero_samples: 10000
+g10_force_sign: -1
+g10_kgf_per_count: 0.0
 ```
 
-在此模式下，系统完整记录 DSHOT 正弦以及换向指令时刻，但 `event.csv` 会写 `NO_RECENT_FORCE`，**不会声称测到了推力响应延迟**。
+`g10_kgf_per_count: 0.0` 表示先用 `raw_count` 测量。启动前让台架完全卸载，节点用最初 1 秒的 10000 点自动归零。此模式的建议初始阈值为 50 counts、连续 10 点（1 ms）。接着放置已知质量 `M_kg` 的砝码，记录稳定后的 `raw_loaded` 和零点 `raw_zero`：
 
-要自动计算，先通过厂家开放的协议或实际可用的数据桥接，把 G10 推力以 `std_msgs/msg/Float64` 发布到例如 `/g10/thrust`，然后修改：
+```text
+g10_kgf_per_count = M_kg / abs(raw_loaded - raw_zero)
+```
+
+填入比例后，`force_unit` 自动变成 kgf，并应把变化/符号阈值按噪声改回约 0.03 kgf 起步。`g10_force_sign` 决定哪一侧为正；如果正转推力显示为负，改成 `1`。
+
+G10 必须接 Ubuntu 的第二块独立网卡并设为 `192.168.127.55/24`；EtherCAT 继续独占原来的实时网卡。不要把两个实时协议接在同一物理口上。
+
+若禁用直接 UDP、改用其他推力桥接，也仍可使用原来的 ROS 话题模式：
 
 ```yaml
+g10_udp_enabled: false
 force_topic: "/g10/thrust"
 force_unit: "kgf"
 force_forward_sign: 1
@@ -96,7 +122,7 @@ force_forward_sign: 1
 
 若正向转动时推力数据为负值，设置 `force_forward_sign: -1`。这只是测量符号校准，不会改变电机转向。
 
-若只有 Windows 厂家软件的 CSV 数据、没有与 ROS 共享的时钟或同步事件，**仅凭两个各自独立的 CSV 时间戳不能可信地计算毫秒级物理延迟**。应先建立同步数据通路或加硬件触发标记。
+若只有 Windows 厂家软件的 CSV 数据、没有与 ROS 共享的时钟或同步事件，**仅凭两个各自独立的 CSV 时间戳不能可信地计算毫秒级物理延迟**。直接 G10 UDP 模式解决的是跨主机时钟问题；设备内部 ADC 滤波、UDP 批处理和 DSHOT 实际发射相对 ROS publish 的偏差仍属于测量链路延迟。要分解到纯硬件响应，仍需 GPIO/逻辑分析仪触发标记。
 
 ## 下载、编译和启动
 
@@ -157,6 +183,7 @@ sdowrite_init_value: !uint16_t 0
 
 - `bidirectional_motor_test/core.py`：开关解锁状态机与正弦 DSHOT 映射，含停机保持。
 - `bidirectional_motor_test/latency.py`：推力变化 / 推力换向的阈值判定。
+- `bidirectional_motor_test/g10_udp.py`：G10 986-byte UDP 帧解析、10 kHz 样本时间重建和接收线程。
 - `bidirectional_motor_test/motor_test_node.py`：ROS 话题、接收回调、定时发布和 CSV。
 - `tests/test_control.py`：纯 Python 单元测试，无需连接电机。
 

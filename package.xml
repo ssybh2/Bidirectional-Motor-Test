@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>bidirectional_motor_test</name>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
   <description>DJI RC gated sinusoidal DSHOT600 reversal test with optional ROS thrust timing.</description>
   <maintainer email="ssybh2@users.noreply.github.com">ssybh2</maintainer>
   <license>MIT</license>
