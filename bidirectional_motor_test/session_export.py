@@ -85,25 +85,46 @@ def _filtered(prefix, kind, start_ns, stop_ns):
         yield fields, row
 
 
-def _select_controller(prefix, start_ns, stop_ns):
-    """Pick ONE same-host control session by actual overlapping timestamps.
+def _select_controller(prefix, start_ns, stop_ns, start_wall_ns=None):
+    """Choose ONE same-boot controller matching BOTH monotonic and wall clocks.
 
-    Never select a controller based only on filename, wall-clock label or
-    mtime; a previous ROS launch may have left stale CSVs in this directory.
+    Monotonic time resets on reboot. Its numeric value alone can overlap with
+    an old experiment at a similar post-boot uptime, so a matching controller
+    MUST also share the same wall-minus-monotonic timebase. This is a
+    consistency check, NOT hardware time synchronization.
     """
     choices = []
     inaccessible = []
+    expected_offset = (
+        start_wall_ns - start_ns if start_wall_ns is not None else None)
     for command_path in Path(prefix).parent.glob("control_*_command.csv"):
+        clock_mismatch = False
         try:
             for _, row in _read_csv(command_path):
                 stamp = _valid_int(row.get("mono_ns"))
                 dshot = _valid_int(row.get("dshot"))
-                if (stamp is not None and start_ns <= stamp <= stop_ns
-                        and dshot is not None and 0 <= dshot <= 2047):
-                    choices.append(str(command_path)[:-len("_command.csv")])
-                    break
+                if (stamp is None or not start_ns <= stamp <= stop_ns
+                        or dshot is None or not 0 <= dshot <= 2047):
+                    continue
+                # The old ZIP and the present-day controller both use Linux
+                # epoch wall_ns and boot-local mono_ns. Legacy tiny synthetic
+                # test stamps are excluded from this real-clock invariant.
+                source_wall_ns = _valid_int(row.get("wall_ns"))
+                if (expected_offset is not None and start_ns > 1_000_000_000
+                        and start_wall_ns > 1_000_000_000_000_000
+                        and source_wall_ns is not None
+                        and abs((source_wall_ns - stamp) -
+                                expected_offset) > 5_000_000_000):
+                    clock_mismatch = True
+                    continue
+                choices.append(str(command_path)[:-len("_command.csv")])
+                break
         except ExportError as exc:
             inaccessible.append(str(exc))
+        if clock_mismatch and len(inaccessible) < 10:
+            inaccessible.append(
+                "Rejected controller %s: wall/monotonic timebase differs "
+                "(possibly from a previous boot)." % command_path.name)
     if len(choices) > 1:
         raise ExportError(
             "Multiple Motor Test command logs overlap this recording; "
@@ -377,7 +398,7 @@ def export_recording(prefix, destination, start_ns, stop_ns,
 
     counts = {}
     controller, control_errors = _select_controller(
-        prefix, start_ns, stop_ns)
+        prefix, start_ns, stop_ns, started_wall_ns)
     warnings = list(control_errors)
     try:
         with tempfile.TemporaryDirectory(prefix="g10_export_") as temp:

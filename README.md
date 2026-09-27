@@ -190,7 +190,7 @@ Motor Test 的 `control_*_command.csv` 本来就记录了每条 DSHOT 的 **`mon
 现在采用两层恢复：
 
 1. **运行期间**：G10 收到 ROS `/bidirectional_motor_test/command_meta` 后仍采用原消息。每 200 ms 还会只读扫描同一工作空间内持续刷新的 `control_*_command.csv` 和 `control_*_event.csv`；通过真实 `mono_ns` 去重/验证，补偿丢失的消息。补偿不创建 DSHOT 发布者，不控制电机。迟到的换向事件根据历史命令时间戳验证，不再只比较「最新命令」导致丢弃。补偿的数据源写在 `g10_*_command.csv` 的 `metadata_source` 字段（`ros` / `control_csv`）。
-2. **导出时**：按实际 `mono_ns` 覆盖的录制区间查找唯一 `control_*_command.csv`，优先用 Motor Test 原始命令构建 ZIP 的 `command.csv` 和 `timeline.csv`。若有原始换向事件而采集端没收到，则把**真实命令 t0** 写入 `event.csv` / `event_summary.csv`，但标记 `metadata_unavailable`，**绝不杜撰推力延迟**。多个控制会话重叠时直接拒绝猜测来源。
+2. **导出时**：按实际 `mono_ns` 覆盖的录制区间查找唯一 `control_*_command.csv`，优先用 Motor Test 原始命令构建 ZIP 的 `command.csv` 和 `timeline.csv`。若有原始换向事件而采集端没收到，则把**真实命令 t0** 写入 `event.csv` / `event_summary.csv`，但标记 `metadata_unavailable`，**绝不杜撰推力延迟**。多个控制会话重叠时直接拒绝猜测来源；同时检查控制端与 G10 录制端的 wall-minus-monotonic 时钟偏移，防止电脑重启后相同开机时长对应的旧控制日志被误匹配。
 
 录制开始前 GUI 会提醒是否只有推力而没有 DSHOT；保存时对「指令存在但延迟未测到」给出醒目的警告。在 ZIP 的 `metadata.json` 检查 `command_source`、`controller_session`、`recovered_control_references`、`latency_status` 和 `data_integrity_warnings`。需要注意：`latency.csv` 只有在采集端实际识别到事件时才有结果；未发生换向、未能确认新鲜基线、尚未到检测阈值或实时元数据持续失败，都可能使其**合理地为空**，这与丢失 DSHOT 指令不同。
 

@@ -244,6 +244,46 @@ class RecordingExportTests(unittest.TestCase):
                 self.logs.prefix, self.output, 100, 300,
                 started_wall_ns=1_790_495_000_000_000_000)
 
+    def test_reboot_with_repeated_monotonic_uptime_is_not_a_match(self):
+        # Two boots can have identical "10s after boot" mono_ns but different
+        # absolute wall_ns. Never attach a previous boot's DSHOT to new G10.
+        mono = 10_000_000_000
+        wall = 1_790_500_000_000_000_000
+        original = SessionLogs(
+            self.path / "continuous", "raw_count", prefix_tag="control")
+        self.addCleanup(original.close)
+        original.write(
+            "command", wall_ns=wall - 86_400_000_000_000,
+            mono_ns=mono + 150_000_000, mode="SINE", channel=1,
+            dshot=1250, sine=0.2, logical_direction=1,
+            phase_rad=0.2, last_force="", force_unit="raw_count")
+        self.write_force(mono + 150_000_000, 12)
+        result = export_recording(
+            self.logs.prefix, self.output,
+            mono + 100_000_000, mono + 200_000_000,
+            started_wall_ns=wall)
+        self.assertEqual(result["counts"]["command"], 0)
+        self.assertTrue(any(
+            "previous boot" in warning for warning in result["warnings"]))
+        with zipfile.ZipFile(result["path"]) as arc:
+            meta = json.loads(arc.read("metadata.json"))
+        self.assertEqual(meta["command_source"], "none")
+        # A controller truly recorded in this boot should be recovered.
+        current = SessionLogs(
+            self.path / "continuous", "raw_count", prefix_tag="control")
+        self.addCleanup(current.close)
+        current.write(
+            "command", wall_ns=wall + 150_000_000,
+            mono_ns=mono + 150_000_000, mode="SINE", channel=1,
+            dshot=1250, sine=0.2, logical_direction=1,
+            phase_rad=0.2, last_force="", force_unit="raw_count")
+        self.assertEqual(
+            __import__("bidirectional_motor_test.session_export",
+                       fromlist=["_select_controller"])._select_controller(
+                self.logs.prefix, mono + 100_000_000,
+                mono + 200_000_000, wall)[0],
+            current.prefix)
+
     def test_no_force_or_missing_folder_never_write_success_archive(self):
         self.write_command(200, 1100, 1)
         with self.assertRaisesRegex(ExportError, "No force samples"):
