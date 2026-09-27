@@ -54,7 +54,18 @@ bidirectional_motor_test:
     g10_auto_zero_samples: 10000  # 1 s; bench must be unloaded at startup
     g10_zero_raw: 0.0
     g10_force_sign: -1
-    g10_kgf_per_count: 0.0   # 0 measures raw_count; set after calibration
+    g10_kgf_per_count: 0.0   # optional manual gain, overrides saved gain
+    # Runtime services: /bidirectional_motor_test/g10_tare and g10_calibrate.
+    # Save only gain to disk; each startup still needs a fresh zero.
+    g10_load_calibration: true
+    g10_calibration_file: "~/bidirectional/calibration/g10_channel6.json"
+    g10_calibration_mass_kg: 0.0   # set dynamically BEFORE g10_calibrate
+    g10_stability_range_counts: 10.0
+    g10_calibration_window_sec: 1.0
+    # Onset/sign thresholds for direct G10 are ALWAYS in native ADC counts,
+    # even after kgf calibration. The node converts these automatically.
+    g10_raw_change_threshold: 50.0
+    g10_raw_sign_threshold: 50.0
     g10_log_decimation: 40   # continuous force.csv ~250 Hz, event window native 10 kHz
     # Ubuntu UDP stream health: block sine output until a calibrated/raw
     # fresh G10 stream is available, including auto-zero completion.

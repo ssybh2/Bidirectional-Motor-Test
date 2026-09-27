@@ -173,6 +173,47 @@ ros2 topic echo /ecat/sn2555957/app2/write
 ls -lt ~/bidirectional/measurements | head -12
 ```
 
+## G10 空载去皮与已知质量标定（Ubuntu ROS 服务）
+
+无需 Windows 软件。三种 ROS 2 服务均只处理 G10 数据，**不会主动启动电机**：
+
+| 服务 | 作用 |
+|---|---|
+| `/bidirectional_motor_test/g10_tare` | 使用最近 1 秒约 1000 个抽取后的稳定 ADC 样本更新零点 |
+| `/bidirectional_motor_test/g10_calibrate` | 使用已知质量（kg）计算并保存 kgf/count 增益 |
+| `/bidirectional_motor_test/g10_calibration_status` | 显示零点、增益、单位、静态窗口状态 |
+
+执行条件：**ESC 动力断开、无桨、遥控器开关 2（DISARM，或没有接入 RC）、DSHOT 0，且 G10 数据在线。** 切忌在带推力/转动中去皮。每次标定都要求连续新鲜的原始样本；若采样窗口峰峰值大于 `g10_stability_range_counts`（默认 10 ADC counts），服务会拒绝。
+
+1. 启动节点，等待 `G10 auto-zero complete`，空载放置至少 2 秒；随后**去皮**：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/bidirectional/install/setup.bash
+ros2 service call /bidirectional_motor_test/g10_tare std_srvs/srv/Trigger "{}"
+ros2 service call /bidirectional_motor_test/g10_calibration_status std_srvs/srv/Trigger "{}"
+```
+
+   成功时会返回新的 `zero_raw` 和当前窗口的 ADC 峰峰值。去皮后空载信号应回到零附近，但小于一个 ADC 计数的量化波动和缓慢漂移仍然正常。此操作**保留既有增益，不会重新计算 kgf/count**。
+
+2. 如果需要把原始计数变成 kgf，沿待测正向放置**实际已知质量** `M_kg` 的稳定载荷，例如 0.5 kg；确保重量的力作用方向与推力传感器的测量方向一致，不是手按。在放稳至少 2 秒后：
+
+```bash
+ros2 param set /bidirectional_motor_test g10_calibration_mass_kg 0.5
+ros2 service call /bidirectional_motor_test/g10_calibrate std_srvs/srv/Trigger "{}"
+ros2 service call /bidirectional_motor_test/g10_calibration_status std_srvs/srv/Trigger "{}"
+```
+
+   公式：`kgf_per_count = M_kg / (g10_force_sign * (ADC_loaded - ADC_zero))`。若增益为负向、已知载荷引起的变化太小（默认需至少 100 counts）、数据不稳定或正在转动，服务会拒绝。需要验证负载为真实重力产生的轴向力，不能只按砝码质量猜测机械施力大小。
+
+3. 标定成功后，可卸载并复查 `force.csv`，其中 `force_unit` 将从 `raw_count` 改为 `kgf`。当前会话已有的原始行仍保留旧单位，**不要把两种单位混为一列连续曲线**。标定的时间与新旧系数记入 `event.csv`。
+
+标定增益自动保存在 `~/bidirectional/calibration/g10_channel6.json`，下次启动时（`g10_load_calibration: true`）会验证设备 IP、ADC 通道和力方向后载入。**零点永远不从旧文件恢复**，每次启动都会重新自动归零，必要时再执行一次 `g10_tare`。若使用新设备或改变推力通道，必须重新确认增益；手动设置 `g10_kgf_per_count > 0` 可覆盖缓存的增益。
+
+直接 G10 的触发阈值现在统一由 `g10_raw_change_threshold`、`g10_raw_sign_threshold` 指定，**始终以 ADC count 配置**。程序在切换到 kgf 时自动转换阈值，不会突然因单位变化失去检测。此前的 `force_change_threshold` 和 `force_sign_threshold` 留给 ROS `force_topic` 输入模式。
+
+**反向测力重要限制：**这台 G10 当前 ADC 通道 6 的空载值约 32688，距有符号 int16 最大值 32767 只有约 79 counts。仅凭已抓到的报文，尚不能判明朝另一方向施力时是饱和、溢出、符号翻转还是另有编码。**一次正向砝码标定不等于双向推力已经可信。** 有桨反转前必须先用安全、已知的双向静态加载实验验证原始编码、测量量程与机械装夹安全性。
+
 ## Ubuntu G10 UDP 首次部署：先验证收包，不要直接通电转桨
 
 **必须使用两块独立物理网卡：EtherCAT 保持原专用网口，G10 接 Ubuntu 的另一块网卡。** 将命令中的 `<G10网卡名>` 替换为 `ip -br link` 查到的实际名称，务必不要改到 EtherCAT 网卡：

@@ -6,12 +6,14 @@ Hardware, real DDS, UDP startup and physical timing are NOT covered.
 
 import importlib
 import sys
+import tempfile
 import time
 import types
 import unittest
 from unittest import mock
 
 from bidirectional_motor_test.core import SineDshot, SwitchInterlock
+from bidirectional_motor_test.g10_calibration import StableADCWindow
 from bidirectional_motor_test.latency import ThrustLatency
 
 
@@ -20,7 +22,8 @@ def _load_node_without_ros():
     replacements = {}
     for name in ("rclpy", "rclpy.node", "rclpy.qos",
                  "std_msgs", "std_msgs.msg",
-                 "custom_msgs", "custom_msgs.msg"):
+                 "custom_msgs", "custom_msgs.msg",
+                 "std_srvs", "std_srvs.srv"):
         replacements[name] = types.ModuleType(name)
     replacements["rclpy"].__path__ = []
     replacements["rclpy.node"].Node = object
@@ -30,6 +33,8 @@ def _load_node_without_ros():
     replacements["custom_msgs"].__path__ = []
     replacements["custom_msgs.msg"].ReadDJIRC = type("ReadDJIRC", (), {})
     replacements["custom_msgs.msg"].WriteDSHOT = type("WriteDSHOT", (), {})
+    replacements["std_srvs"].__path__ = []
+    replacements["std_srvs.srv"].Trigger = type("Trigger", (), {})
     with mock.patch.dict(sys.modules, replacements):
         return importlib.import_module("bidirectional_motor_test.motor_test_node")
 
@@ -78,6 +83,75 @@ class NodeTickTests(unittest.TestCase):
         node._publish = lambda val, *args: (
             node.published.append(val) or time.monotonic_ns())
         return node
+
+    def test_real_tare_then_known_mass_service_and_persistence(self):
+        node = self.make_node()
+        node.last_mode = "DISARM"
+        node.last_command = 0
+        node.wave.running = False
+        node.g10 = types.SimpleNamespace(error=None)
+        node.g10_adc_channel = 6
+        node.g10_device_ip = "192.168.127.56"
+        node.g10_force_sign = -1
+        node.g10_zero_raw = 32680.0
+        node.g10_kgf_per_count = 0.0
+        node.g10_no_packet_timeout_ns = 150_000_000
+        node.g10_stability_range_counts = 10
+        node.g10_raw_change_threshold = 50
+        node.g10_raw_sign_threshold = 50
+        node.g10_calibration_window = StableADCWindow(
+            sample_period_ns=100_000, window_sec=.1)
+        node.logs = types.SimpleNamespace(force_unit="raw_count")
+        node.get_parameter = lambda key: types.SimpleNamespace(value=.5)
+        with tempfile.TemporaryDirectory() as d:
+            node.g10_calibration_file = d + "/gain.json"
+
+            def fill_window(raw):
+                now = time.monotonic_ns()
+                for i in range(1200):
+                    node.g10_calibration_window.add(
+                        now - 120_000_000 + i * 100_000, raw)
+
+            fill_window(32688)
+            result = node._on_g10_tare(
+                None, types.SimpleNamespace(success=False, message=""))
+            self.assertTrue(result.success, result.message)
+            self.assertAlmostEqual(node.g10_zero_raw, 32688)
+            self.assertIsNone(node.last_force)
+
+            # Must gather NEW, unloaded/loaded data after taring.
+            denied = node._on_g10_calibrate(
+                None, types.SimpleNamespace(success=False, message=""))
+            self.assertFalse(denied.success)
+            self.assertIn("need", denied.message)
+
+            fill_window(31088)
+            result = node._on_g10_calibrate(
+                None, types.SimpleNamespace(success=False, message=""))
+            self.assertTrue(result.success, result.message)
+            self.assertAlmostEqual(node.g10_kgf_per_count, .5 / 1600)
+            self.assertEqual(node.force_unit, "kgf")
+            self.assertEqual(node.logs.force_unit, "kgf")
+            self.assertAlmostEqual(node.latency.delta_threshold,
+                                   50 * .5 / 1600)
+            self.assertAlmostEqual(node.latency.sign_threshold,
+                                   50 * .5 / 1600)
+
+    def test_tare_refused_when_motor_is_armed_or_active(self):
+        node = self.make_node()
+        node.last_mode = "ARMED"
+        node.last_command = 0
+        node.wave.running = False
+        response = node._on_g10_tare(
+            None, types.SimpleNamespace(success=False, message=""))
+        self.assertFalse(response.success)
+        self.assertIn("DISARM", response.message)
+        node.last_mode = "DISARM"
+        node.last_command = 1048
+        response = node._on_g10_tare(
+            None, types.SimpleNamespace(success=False, message=""))
+        self.assertFalse(response.success)
+        self.assertIn("stop the motor", response.message)
 
     def test_udp_event_starts_real_latency_tracker(self):
         node = self.make_node()

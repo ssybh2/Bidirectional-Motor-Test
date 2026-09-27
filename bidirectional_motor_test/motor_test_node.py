@@ -11,10 +11,15 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Float64
+from std_srvs.srv import Trigger
 from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 
 from .core import SineDshot, SwitchInterlock
 from .g10_udp import G10UDPReceiver
+from .g10_calibration import (
+    CalibrationError, StableADCWindow, load_scale, save_scale,
+    scale_for_known_mass,
+)
 from .g10_health import baseline_ready, g10_health
 from .latency import ThrustLatency
 from .raw_capture import RawWindowRecorder
@@ -62,6 +67,13 @@ class BidirectionalMotorTest(Node):
             "g10_zero_raw": 0.0,
             "g10_force_sign": -1,
             "g10_kgf_per_count": 0.0,
+            "g10_load_calibration": True,
+            "g10_calibration_file": "~/bidirectional/calibration/g10_channel6.json",
+            "g10_calibration_mass_kg": 0.0,
+            "g10_stability_range_counts": 10.0,
+            "g10_calibration_window_sec": 1.0,
+            "g10_raw_change_threshold": 50.0,
+            "g10_raw_sign_threshold": 50.0,
             "g10_log_decimation": 40,
             "g10_require_healthy": True,
             "g10_no_packet_timeout_sec": 0.15,
@@ -89,6 +101,7 @@ class BidirectionalMotorTest(Node):
         self.force_unit = str(p["force_unit"])
         self.force_topic = str(p["force_topic"])
         self.g10_enabled = bool(p["g10_udp_enabled"])
+        self.g10_device_ip = str(p["g10_device_ip"])
         self.g10_adc_channel = int(p["g10_adc_channel"])
         self.g10_sample_period_ns = int(p["g10_sample_period_ns"])
         self.g10_arrival_bias_ns = int(p["g10_arrival_bias_ns"])
@@ -97,6 +110,16 @@ class BidirectionalMotorTest(Node):
         self.g10_zero_raw = float(p["g10_zero_raw"])
         self.g10_force_sign = int(p["g10_force_sign"])
         self.g10_kgf_per_count = float(p["g10_kgf_per_count"])
+        self.g10_calibration_file = str(p["g10_calibration_file"])
+        self.g10_load_calibration = bool(p["g10_load_calibration"])
+        self.g10_stability_range_counts = float(
+            p["g10_stability_range_counts"])
+        self.g10_calibration_window_sec = float(
+            p["g10_calibration_window_sec"])
+        self.g10_raw_change_threshold = float(
+            p["g10_raw_change_threshold"])
+        self.g10_raw_sign_threshold = float(
+            p["g10_raw_sign_threshold"])
         self.g10_log_decimation = int(p["g10_log_decimation"])
         self.g10_require_healthy = bool(p["g10_require_healthy"])
         self.g10_no_packet_timeout_ns = round(
@@ -142,9 +165,37 @@ class BidirectionalMotorTest(Node):
             raise ValueError("G10 processing and backlog limits must be > 0")
         if self.g10_raw_pre_sec < 0 or self.g10_raw_post_sec <= 0:
             raise ValueError("G10 raw event windows must be nonnegative/positive")
+        if (not math.isfinite(self.g10_stability_range_counts) or
+                self.g10_stability_range_counts <= 0):
+            raise ValueError("G10 static stability range must be positive")
+        if (not math.isfinite(self.g10_raw_change_threshold) or
+                not math.isfinite(self.g10_raw_sign_threshold) or
+                self.g10_raw_change_threshold <= 0 or
+                self.g10_raw_sign_threshold <= 0):
+            raise ValueError("G10 raw thresholds must be positive")
+        if not math.isfinite(self.g10_kgf_per_count):
+            raise ValueError("G10 scale must be finite")
+        if self.g10_enabled and not self.g10_calibration_file:
+            raise ValueError("G10 calibration file must be configured")
         if self.require_rpm and not self.rpm_topic:
             raise ValueError("require_rpm_for_reversal needs a nonempty rpm_topic")
 
+        if (self.g10_enabled and self.g10_load_calibration and
+                self.g10_kgf_per_count == 0):
+            stored = load_scale(
+                self.g10_calibration_file, self.g10_device_ip,
+                self.g10_adc_channel, self.g10_force_sign)
+            if stored is not None:
+                self.g10_kgf_per_count = stored
+                self.get_logger().info(
+                    "Loaded G10 gain %.10g kgf/count from %s; "
+                    "a fresh zero is still required" %
+                    (stored, self.g10_calibration_file))
+        self.g10_calibration_window = (
+            StableADCWindow(
+                sample_period_ns=self.g10_sample_period_ns,
+                window_sec=self.g10_calibration_window_sec)
+            if self.g10_enabled else None)
         if self.g10_enabled:
             self.force_unit = ("kgf" if self.g10_kgf_per_count > 0
                                else "raw_count")
@@ -158,8 +209,14 @@ class BidirectionalMotorTest(Node):
             invert_direction=bool(p["invert_direction"]),
         )
         self.latency = ThrustLatency(
-            delta_threshold=float(p["force_change_threshold"]),
-            sign_threshold=float(p["force_sign_threshold"]),
+            delta_threshold=(
+                self.g10_raw_change_threshold *
+                (self.g10_kgf_per_count or 1.0) if self.g10_enabled
+                else float(p["force_change_threshold"])),
+            sign_threshold=(
+                self.g10_raw_sign_threshold *
+                (self.g10_kgf_per_count or 1.0) if self.g10_enabled
+                else float(p["force_sign_threshold"])),
             confirm_samples=int(p["force_confirm_samples"]),
             timeout_sec=float(p["force_latency_timeout_sec"]),
         )
@@ -212,7 +269,17 @@ class BidirectionalMotorTest(Node):
                 Float64, self.rpm_topic, self._on_rpm,
                 qos_profile_sensor_data)
 
+        self.g10_tare_service = None
+        self.g10_calibrate_service = None
+        self.g10_calibration_status_service = None
         if self.g10_enabled:
+            self.g10_tare_service = self.create_service(
+                Trigger, "~/g10_tare", self._on_g10_tare)
+            self.g10_calibrate_service = self.create_service(
+                Trigger, "~/g10_calibrate", self._on_g10_calibrate)
+            self.g10_calibration_status_service = self.create_service(
+                Trigger, "~/g10_calibration_status",
+                self._on_g10_calibration_status)
             self.g10 = G10UDPReceiver(
                 bind_host=str(p["g10_bind_host"]),
                 port=int(p["g10_udp_port"]),
@@ -402,6 +469,7 @@ class BidirectionalMotorTest(Node):
                 self.g10_arrival_bias_ns)
             for sample_ns, channels in zip(timestamps, packet.samples):
                 raw = float(channels[self.g10_adc_channel])
+                self.g10_calibration_window.add(sample_ns, raw)
                 if (self.g10_auto_zero and
                         self.g10_zero_count < self.g10_auto_zero_samples):
                     self.g10_zero_sum += raw
@@ -412,6 +480,12 @@ class BidirectionalMotorTest(Node):
                         self.get_logger().info(
                             "G10 auto-zero complete: %.6f raw counts" %
                             self.g10_zero_raw)
+                        if abs(self.g10_zero_raw) > 32567:
+                            self.get_logger().warn(
+                                "G10 channel is near signed int16 limit: "
+                                "zero=%.3f, reverse-direction headroom "
+                                "must be verified before motor tests" %
+                                self.g10_zero_raw)
                     continue
                 scale = (self.g10_kgf_per_count
                          if self.g10_kgf_per_count > 0 else 1.0)
@@ -425,6 +499,104 @@ class BidirectionalMotorTest(Node):
                     sample_ns, raw, force,
                     log_sample=(self.g10_sample_count %
                                 self.g10_log_decimation == 0))
+
+    def _calibration_guard(self):
+        """No calibrating while spinning, armed, or while ADC stream is bad."""
+        if not self.g10_enabled or self.g10 is None:
+            raise CalibrationError("direct G10 UDP is disabled")
+        if self.last_command != 0 or self.wave.running:
+            raise CalibrationError("stop the motor first (DSHOT must be 0)")
+        if self.last_mode not in ("DISARM", "WAIT_FOR_RC"):
+            raise CalibrationError(
+                "RC must be DISARM (switch 2), or no RC connected")
+        ready, reason = self._g10_status(time.monotonic_ns())
+        if not ready:
+            raise CalibrationError("G10 stream not ready: " + reason)
+        return self.g10_calibration_window.snapshot(
+            time.monotonic_ns(), self.g10_no_packet_timeout_ns,
+            self.g10_stability_range_counts)
+
+    def _on_g10_tare(self, request, response):
+        """Capture a fresh stable *unloaded* mean, without changing gain."""
+        try:
+            mean, spread, count = self._calibration_guard()
+            self.g10_zero_raw = mean
+            self.g10_calibration_window.clear()
+            self.last_force = None
+            self.last_force_ns = None
+            self.latency.cancel()
+            self._log_event(
+                "g10_tare", mode=self.last_mode,
+                detail="zero_raw=%.6f; range=%.3f; samples=%d" %
+                (mean, spread, count))
+            response.success = True
+            response.message = (
+                "Tare OK: zero_raw=%.6f, p2p=%.3f counts, %d samples; "
+                "gain unchanged. Remove load before taring." %
+                (mean, spread, count))
+        except CalibrationError as exc:
+            response.success = False
+            response.message = "Tare refused: " + str(exc)
+        return response
+
+    def _on_g10_calibrate(self, request, response):
+        """Use a stable known positive-axis mass; persist gain, not offset."""
+        try:
+            mean, spread, count = self._calibration_guard()
+            mass_kg = float(self.get_parameter(
+                "g10_calibration_mass_kg").value)
+            scale, delta = scale_for_known_mass(
+                mass_kg, mean, self.g10_zero_raw,
+                self.g10_force_sign)
+            save_scale(
+                self.g10_calibration_file, self.g10_device_ip,
+                self.g10_adc_channel, self.g10_force_sign,
+                scale, mass_kg, delta)
+            self.g10_kgf_per_count = scale
+            self.force_unit = "kgf"
+            self.logs.force_unit = "kgf"
+            # Raw thresholds always keep their raw-count meaning, so a
+            # runtime gain change cannot silently change onset sensitivity.
+            self.latency.delta_threshold = (
+                self.g10_raw_change_threshold * scale)
+            self.latency.sign_threshold = (
+                self.g10_raw_sign_threshold * scale)
+            self.g10_calibration_window.clear()
+            self.last_force = None
+            self.last_force_ns = None
+            self.latency.cancel()
+            self._log_event(
+                "g10_gain_calibrated", mode=self.last_mode,
+                detail=(
+                    "mass_kg=%.6f; delta_raw=%.6f; kgf_per_count=%.12g; "
+                    "zero_raw=%.6f; p2p=%.3f; samples=%d" %
+                    (mass_kg, delta, scale, self.g10_zero_raw,
+                     spread, count)))
+            response.success = True
+            response.message = (
+                "Calibration OK: %.12g kgf/count from %.6f kg load "
+                "(%.3f counts); saved to %s. "
+                "Zero is re-measured on next startup." %
+                (scale, mass_kg, delta, self.g10_calibration_file))
+        except (CalibrationError, ValueError) as exc:
+            response.success = False
+            response.message = "Calibration refused: " + str(exc)
+        return response
+
+    def _on_g10_calibration_status(self, request, response):
+        try:
+            mean, spread, count = self._calibration_guard()
+            stable = ("recent stable mean=%.6f raw, p2p=%.3f, n=%d"
+                      % (mean, spread, count))
+        except CalibrationError as exc:
+            stable = "stable-window unavailable: " + str(exc)
+        response.success = True
+        response.message = (
+            "zero_raw=%.6f; gain=%.12g kgf/count; unit=%s; "
+            "channel=%d; %s" %
+            (self.g10_zero_raw, self.g10_kgf_per_count,
+             self.force_unit, self.g10_adc_channel, stable))
+        return response
 
     def _log_result(self, result):
         self.logs.write(
