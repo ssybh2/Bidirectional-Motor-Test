@@ -18,6 +18,7 @@ class CaptureSeparationTests(unittest.TestCase):
     def make_capture(self):
         node = object.__new__(self.module.BidirectionalMotorTest)
         node.acquisition_only = True
+        node.g10_enabled = True
         node.rows, node.stopped = [], []
         node.logs = types.SimpleNamespace(
             write=lambda record_type, **row: node.rows.append((record_type, row)),
