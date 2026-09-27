@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import deque
 import math
 import os
+import queue
 import tempfile
 from pathlib import Path
 import re
@@ -80,6 +81,7 @@ class Dashboard:
         self.stop_requested = False
         self.recording = None
         self.record_saving = False
+        self.worker_results = queue.Queue()
         self.record_dir = Path(os.environ.get(
             "G10_EXPORT_DIR", "~/bidirectional/recordings")).expanduser()
         self.record_status = tk.StringVar(value="● 未录制")
@@ -101,6 +103,7 @@ class Dashboard:
         self._build()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(250, self._refresh)
+        root.after(40, self._drain_worker_results)
 
     def _txt(self, parent, value, size=11, fg=INK, bold=False, **kwargs):
         return tk.Label(
@@ -305,6 +308,30 @@ class Dashboard:
 
     def _set_note(self, text):
         self.status_note.set(text)
+
+    def _drain_worker_results(self):
+        """Only Tk's main thread is allowed to touch widgets or root.after.
+
+        Worker threads publish plain objects into Queue. This also works
+        under root.update() tests, where Tk mainloop() is not active.
+        """
+        try:
+            while True:
+                item = self.worker_results.get_nowait()
+                kind = item[0]
+                if kind == "record_success":
+                    self._record_exported(item[1], item[2])
+                elif kind == "record_failure":
+                    self._record_export_failed(item[1])
+                elif kind == "cli":
+                    item[1](item[2], item[3])
+        except queue.Empty:
+            pass
+        try:
+            if self.root.winfo_exists():
+                self.root.after(40, self._drain_worker_results)
+        except tk.TclError:
+            pass
 
     def _refresh(self):
         if self.closing:
@@ -557,13 +584,10 @@ class Dashboard:
                     session["start_ns"], session["stop_ns"],
                     session["start_wall_ns"], session["stop_wall_ns"])
             except Exception as exc:
-                error = str(exc)
-                self.root.after(
-                    0, lambda error=error: self._record_export_failed(error))
+                self.worker_results.put(("record_failure", str(exc)))
             else:
-                self.root.after(
-                    0, lambda result=result: self._record_exported(
-                        result, after_save))
+                self.worker_results.put((
+                    "record_success", result, after_save))
 
         threading.Thread(
             target=worker, daemon=True, name="g10_record_export").start()
@@ -709,13 +733,12 @@ class Dashboard:
                     ros_command(*args), capture_output=True, text=True,
                     timeout=timeout, check=False)
                 output = (result.stdout + "\n" + result.stderr).strip()
-                self.root.after(
-                    0, lambda: callback(
-                        result.returncode == 0, output[-1800:]))
+                self.worker_results.put(
+                    ("cli", callback,
+                     result.returncode == 0, output[-1800:]))
             except Exception as exc:
-                message = str(exc)
-                self.root.after(
-                    0, lambda message=message: callback(False, message))
+                self.worker_results.put((
+                    "cli", callback, False, str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
 
