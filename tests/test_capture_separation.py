@@ -172,6 +172,42 @@ class CaptureSeparationTests(unittest.TestCase):
             finally:
                 ctl.close()
 
+    def test_control_csv_recovers_real_reversal_flag_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ctl = SessionLogs(folder, "raw_count", prefix_tag="control")
+            try:
+                t0 = time.monotonic_ns() - 30_000_000
+                t1 = t0 + 20_000_000
+                for stamp, dshot, direction in (
+                        (t0, 1100, 1), (t1, 49, -1)):
+                    ctl.write(
+                        "command", wall_ns=time.time_ns(), mono_ns=stamp,
+                        mode="SINE", channel=1, dshot=dshot,
+                        sine=.1, logical_direction=direction,
+                        phase_rad=.1, last_force="",
+                        force_unit="raw_count")
+                ctl.write(
+                    "event", wall_ns=time.time_ns(), mono_ns=t0,
+                    event_id=1, kind="force_response_reference",
+                    mode="SINE", dshot=1100, sine=.1,
+                    detail="startup first command")
+                ctl.write(
+                    "event", wall_ns=time.time_ns(), mono_ns=t1,
+                    event_id=2, kind="force_response_reference",
+                    mode="SINE", dshot=49, sine=-.1,
+                    detail="reversal_from=1 reversal_to=-1")
+                _, data = recent_control_metadata(
+                    folder, time.monotonic_ns())
+                refs = [row for row in data if row["type"] == "reference"]
+                self.assertEqual(len(refs), 2)
+                self.assertFalse(refs[0]["reversal"])
+                self.assertTrue(refs[1]["reversal"])
+                self.assertEqual(refs[1]["from_direction"], 1)
+                self.assertEqual(refs[1]["direction"], -1)
+                self.assertEqual(refs[1]["mono_ns"], t1)
+            finally:
+                ctl.close()
+
     def test_disarm_cancels_incomplete_latency_without_motor_publish(self):
         node = self.make_capture()
         t0 = time.monotonic_ns() - 10_000_000

@@ -263,3 +263,41 @@ sequence_clock_max_abs_residual_ms，以便识别模型漂移和调度异常。
 这些变化仅影响 G10 时间估计、测量和记录，不改变 Motor Test
 的 DSHOT 输出、正反向控制参数、急停或联锁。更新时先物理断开
 ESC 动力并关闭旧 GUI / 采集节点，重新启动后再做静态验证。
+
+
+## 10. 换向延迟：第一条反向 DSHOT → G10 确认反向推力
+
+**这是与旧 force_onset、target_sign 不同的新测量指标。**
+
+- 起点 t0：Motor Test 在同一轮 SINE 运行中首次发布与上一方向相反的
+  非零 DSHOT 指令的 ROS 单调时钟时间。中间的 DSHOT 0、固定停转
+  等待和首次启动均不计入换向起点。
+- G10 将每个实际收到的 UDP 包的 40 个推力点取中位数。中位数进入
+  新方向且超过 g10_reversal_raw_sign_threshold（默认 4 raw_count），
+  并连续保持 g10_reversal_stable_sec（默认 0.20s、至少 10 包），
+  才算检测到持续的推力方向变化，避免 1ms 瞬态尖峰被当成换向完成。
+  指标中的 observed_mono_ns 是持续变化的第一个 UDP 包的接收时刻，
+  confirmed_mono_ns 是稳定性确认结束时刻。虽然会等确认结束再输出，
+  latency_ms 仍以第一次接收时刻为终点，不额外计入稳定等待时长。
+- 首次正向启动不计入反转。没有前置有效推力、发出 t0 之前已是目标
+  推力方向、数据流中断、控制模式退出以及没有达到稳定条件的事件
+  均保留失败或未测量状态，绝不填充虚假的延迟数字。
+
+新 ZIP 的 reversal_summary.csv 是直接查看正→反、反→正延迟的表，
+包含指令发出时间、首次持续反向推力观测时间、确认时间、测量值
+和状态。event_summary.csv、latency.csv 也保留对应信息。GUI 实时
+延迟及最终汇总优先显示新的 force_direction_change，而不把旧
+force_onset 作为换向延迟。
+
+**时钟边界：** G10 的 sequence-paced ADC 时间轴曾出现「估算样本
+时间晚于数据包接收时间」的不可能现象。为避免虚假亚毫秒精度，
+新指标的终点使用主机实际收包的 time.monotonic_ns()，因此反映
+的是「ROS 发布时间 → Linux 主机观测到持续目标推力」。
+它包含设备采样、打包、UDP 网络和系统调度延迟，不是 ESC 实际
+执行或转子 RPM 完成反转的硬件同步测量。如果需要纯物理电机延迟，
+必须额外校准测量链或增加共同硬件触发。
+
+这个变更**只修改 G10 测量与 ZIP 输出**，不修改 Motor Test 的
+正弦、换向暂停、RPM 保护或任何 DSHOT 安全行为。升级时先断开
+ESC 动力并完全退出旧 GUI/采集节点；若本地 motor_test.yaml 有
+未提交的实验参数，备份并 stash，再 git pull，最后合并检查参数。

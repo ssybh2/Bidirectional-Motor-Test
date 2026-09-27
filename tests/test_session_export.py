@@ -332,6 +332,75 @@ class RecordingExportTests(unittest.TestCase):
             any("residual" in warning for warning in result["warnings"]))
         self.assertEqual(result["counts"]["force"], 1)
 
+    def test_reversal_summary_only_counts_opposite_nonzero_dshot(self):
+        self.write_command(200, 1100, 1)
+        self.write_event(200, event_id=1)  # startup, NOT a reversal
+        self.write_command(400, 49, -1)
+        self.write_event(
+            400, event_id=2,
+            detail="baseline=10 reversal_from=1 reversal_to=-1")
+        self.write_force(220, 10)
+        self.write_force(430, -5)
+        self.logs.write(
+            "latency", event_id=2, metric="force_direction_change",
+            status="detected", command_mono_ns=400,
+            observed_mono_ns=443, confirmed_mono_ns=484,
+            latency_ms=43.0, baseline_force=10.0,
+            observed_force=-8.0, force_unit="raw_count",
+            from_direction=1, to_direction=-1,
+            clock_source="g10_udp_host_receive")
+        result = export_recording(
+            self.logs.prefix, self.output, 100, 500,
+            started_wall_ns=1_790_495_000_000_000_000)
+        self.assertEqual(result["events"], 2)
+        self.assertEqual(result["reversal_events"], 1)
+        self.assertEqual(result["reversal_detected"], 1)
+        self.assertEqual(result["reversal_mean_ms"], 43.0)
+        with zipfile.ZipFile(result["path"]) as arc:
+            summary = read_zip_csv(arc, "event_summary.csv")
+            self.assertEqual(summary[0]["reversal_status"], "not_reversal")
+            self.assertEqual(summary[1]["reversal_status"], "detected")
+            rows = read_zip_csv(arc, "reversal_summary.csv")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["from_direction"], "1")
+            self.assertEqual(rows[0]["to_direction"], "-1")
+            self.assertEqual(rows[0]["command_mono_ns"], "400")
+            self.assertEqual(rows[0]["direction_crossing_receive_ns"], "443")
+            self.assertEqual(rows[0]["confirmed_receive_ns"], "484")
+            self.assertEqual(rows[0]["delay_ms"], "43.0")
+            self.assertEqual(rows[0]["clock_source"],
+                             "g10_udp_host_receive")
+            meta = json.loads(arc.read("metadata.json"))
+            self.assertEqual(meta["reversal_detected"], 1)
+            self.assertIn("FIRST opposite nonzero DSHOT",
+                          meta["reversal_latency_definition"])
+
+    def test_reversal_unconfirmed_inside_recording_has_no_delay(self):
+        self.write_command(200, 1200, 1)
+        self.write_command(400, 49, -1)
+        self.write_event(400, 1,
+                         detail="reversal_from=1 reversal_to=-1")
+        self.write_force(420, -5)
+        # Detection was completed AFTER the GUI recording stopped. It
+        # cannot be presented as a confirmed result in this bounded ZIP.
+        self.logs.write(
+            "latency", event_id=1, metric="force_direction_change",
+            status="detected", command_mono_ns=400,
+            observed_mono_ns=450, confirmed_mono_ns=650,
+            latency_ms=50.0, baseline_force=10.0,
+            observed_force=-8.0, force_unit="raw_count",
+            from_direction=1, to_direction=-1,
+            clock_source="g10_udp_host_receive")
+        result = export_recording(
+            self.logs.prefix, self.output, 100, 500,
+            started_wall_ns=1_790_495_000_000_000_000)
+        self.assertEqual(result["reversal_events"], 1)
+        self.assertEqual(result["reversal_detected"], 0)
+        with zipfile.ZipFile(result["path"]) as arc:
+            row = read_zip_csv(arc, "reversal_summary.csv")[0]
+            self.assertEqual(row["status"], "unresolved_at_stop")
+            self.assertEqual(row["delay_ms"], "")
+
     def test_no_force_or_missing_folder_never_write_success_archive(self):
         self.write_command(200, 1100, 1)
         with self.assertRaisesRegex(ExportError, "No force samples"):

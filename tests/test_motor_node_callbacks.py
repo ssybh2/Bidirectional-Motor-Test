@@ -81,6 +81,8 @@ class NodeTickTests(unittest.TestCase):
         node.last_wave_stopped_ns = None
         node.event_id = 0
         node.raw_capture = None
+        node.reversal_detector = None
+        node.reversal_packet_history = deque()
         node._rpm_ready = lambda now: True
         node._g10_status = lambda now: (True, "ready")
         node._log_event = lambda *a, **kw: None

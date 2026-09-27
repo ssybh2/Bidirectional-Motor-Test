@@ -9,6 +9,7 @@ import queue
 import sys
 import time
 from collections import deque
+from statistics import median
 from pathlib import Path
 
 import rclpy
@@ -28,6 +29,7 @@ from .g10_calibration import (
 from .g10_health import baseline_ready, g10_health
 from .latency import ThrustLatency
 from .raw_capture import RawWindowRecorder
+from .reversal_latency import ReversalDirectionTracker
 from .session_logs import SessionLogs
 
 
@@ -82,6 +84,9 @@ class BidirectionalMotorTest(Node):
             "g10_calibration_window_sec": 1.0,
             "g10_raw_change_threshold": 50.0,
             "g10_raw_sign_threshold": 50.0,
+            # Force-sign reversal measurement ONLY; not motor safety/DSHOT.
+            "g10_reversal_raw_sign_threshold": 4.0,
+            "g10_reversal_stable_sec": 0.2,
             "g10_log_decimation": 40,
             "g10_channel_log_decimation": 4,
             "g10_require_healthy": True,
@@ -132,6 +137,10 @@ class BidirectionalMotorTest(Node):
             p["g10_raw_change_threshold"])
         self.g10_raw_sign_threshold = float(
             p["g10_raw_sign_threshold"])
+        self.g10_reversal_raw_sign_threshold = float(
+            p["g10_reversal_raw_sign_threshold"])
+        self.g10_reversal_stable_sec = float(
+            p["g10_reversal_stable_sec"])
         self.g10_log_decimation = int(p["g10_log_decimation"])
         self.g10_channel_log_decimation = int(
             p["g10_channel_log_decimation"])
@@ -195,6 +204,11 @@ class BidirectionalMotorTest(Node):
             raise ValueError("G10 raw thresholds must be positive")
         if not math.isfinite(self.g10_kgf_per_count):
             raise ValueError("G10 scale must be finite")
+        if (not math.isfinite(self.g10_reversal_raw_sign_threshold) or
+                self.g10_reversal_raw_sign_threshold <= 0 or
+                not math.isfinite(self.g10_reversal_stable_sec) or
+                self.g10_reversal_stable_sec <= 0):
+            raise ValueError("G10 reversal threshold/stable_sec must be > 0")
         if self.g10_enabled and not self.g10_calibration_file:
             raise ValueError("G10 calibration file must be configured")
         if self.require_rpm and not self.rpm_topic:
@@ -237,6 +251,13 @@ class BidirectionalMotorTest(Node):
             reversal_pause_sec=float(p["reversal_pause_sec"]),
             invert_direction=bool(p["invert_direction"]),
         )
+        self.reversal_detector = (
+            ReversalDirectionTracker(
+                sign_threshold=self.g10_reversal_raw_sign_threshold *
+                (self.g10_kgf_per_count or 1.0),
+                stable_sec=self.g10_reversal_stable_sec,
+                timeout_sec=float(p["force_latency_timeout_sec"]))
+            if self.acquisition_only else None)
         self.latency = ThrustLatency(
             delta_threshold=(
                 self.g10_raw_change_threshold *
@@ -267,6 +288,9 @@ class BidirectionalMotorTest(Node):
         self.last_force = None
         self.last_force_ns = None
         self.force_history = deque(maxlen=30000)
+        # Original UDP packet receipt stamps; never confuse with the
+        # sequence-paced ADC estimate when timing physical sign changes.
+        self.reversal_packet_history = deque(maxlen=3000)
         self.last_remote_command_rx_ns = None
         self.last_remote_command_ns = None
         self.command_signatures = {}  # exact t0 -> validated mode, value, direction
@@ -381,8 +405,11 @@ class BidirectionalMotorTest(Node):
                  "zero=%.3f" % self.g10_zero_raw))
 
     def _log_event(self, kind, mode="", dshot=0, sine=0.0, detail="",
-                   event_id=0, now_ns=None, direction=0):
+                   event_id=0, now_ns=None, direction=0, reversal_from=0):
         now_ns = time.monotonic_ns() if now_ns is None else now_ns
+        if kind == "force_response_reference" and reversal_from:
+            detail += " reversal_from=%d reversal_to=%d" % (
+                reversal_from, direction)
         self.logs.write(
             "event", wall_ns=time.time_ns(), mono_ns=now_ns,
             event_id=event_id, kind=kind, mode=mode,
@@ -392,7 +419,9 @@ class BidirectionalMotorTest(Node):
             self._relay_command({
                 "type": "reference", "mono_ns": now_ns, "mode": mode,
                 "dshot": dshot, "sine": sine, "direction": direction,
-                "control_event_id": event_id})
+                "control_event_id": event_id,
+                "reversal": bool(reversal_from),
+                "from_direction": reversal_from})
 
     def _relay_command(self, payload):
         publisher = getattr(self, "command_pub", None)
@@ -418,6 +447,9 @@ class BidirectionalMotorTest(Node):
             self._recover_control_csv(now)
         for result in self.latency.expire(now):
             self._log_result(result)
+        if self.reversal_detector is not None:
+            for result in self.reversal_detector.expire(now):
+                self._log_result(result)
 
     def _recover_control_csv(self, now_ns):
         prefix, rows = recent_control_metadata(
@@ -477,6 +509,10 @@ class BidirectionalMotorTest(Node):
                 # Stopping G10 capture itself never publishes DSHOT.
                 if mode != "SINE":
                     self.latency.cancel()
+                    if self.reversal_detector is not None:
+                        for result in self.reversal_detector.cancel(
+                                "command_stopped"):
+                            self._log_result(result)
                 self.logs.write(
                     "command", wall_ns=int(event["wall_ns"]),
                     mono_ns=stamp, mode=mode, channel=int(event["channel"]),
@@ -514,10 +550,18 @@ class BidirectionalMotorTest(Node):
                         if stamp - ns <= self.force_max_age_ns:
                             baseline = force
                         break
+                from_direction = (
+                    int(event.get("from_direction", 0))
+                    if event.get("reversal") is True else 0)
+                if from_direction and from_direction != -direction:
+                    self.get_logger().warn(
+                        "Ignored invalid reversal directions at t0=%d" % stamp)
+                    from_direction = 0
                 self._log_event(
                     "force_response_reference",
                     mode=str(event["mode"]), dshot=int(event["dshot"]),
                     sine=float(event["sine"]), now_ns=stamp, event_id=eid,
+                    direction=direction, reversal_from=from_direction,
                     detail=(
                         "force baseline=%.6g %s; controller_event=%d" %
                         (baseline, self.force_unit,
@@ -532,6 +576,24 @@ class BidirectionalMotorTest(Node):
                     for ns, force in tuple(self.force_history):
                         if ns > stamp:
                             for result in self.latency.observe(ns, force):
+                                self._log_result(result)
+                if from_direction and self.reversal_detector is not None:
+                    # Only the first OPPOSITE nonzero DSHOT command marks t0.
+                    # Packet receipt is a causal host clock; replay packets
+                    # received before metadata delivery at their ORIGINAL rx.
+                    recent = tuple(self.reversal_packet_history)
+                    before = next((
+                        (rx, force) for rx, force in reversed(recent)
+                        if rx <= stamp and
+                        stamp - rx <= self.force_max_age_ns), None)
+                    for result in self.reversal_detector.start(
+                            eid, stamp, from_direction, direction,
+                            before[1] if before is not None else None):
+                        self._log_result(result)
+                    for rx, force in recent:
+                        if rx > stamp:
+                            for result in self.reversal_detector.observe_packet(
+                                    rx, force):
                                 self._log_result(result)
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             self.get_logger().warn(
@@ -593,6 +655,9 @@ class BidirectionalMotorTest(Node):
         """Collector faults never change motor control or publish DSHOT."""
         if getattr(self, "acquisition_only", False):
             self.latency.cancel()
+            if self.reversal_detector is not None:
+                for result in self.reversal_detector.cancel("stream_fault"):
+                    self._log_result(result)
             self._log_event("g10_data_fault", mode="G10_UNREADY",
                             detail=reason)
             self.get_logger().warn(
@@ -721,6 +786,7 @@ class BidirectionalMotorTest(Node):
                     packet_sequence=packet.sequence,
                     **{"adc_%d" % i: int(value)
                        for i, value in enumerate(latest_channels)})
+            packet_forces = []
             for sample_ns, channels in zip(timestamps, packet.samples):
                 raw = float(channels[self.g10_adc_channel])
                 self.g10_calibration_window.add(sample_ns, raw)
@@ -755,6 +821,7 @@ class BidirectionalMotorTest(Node):
                     adc_delta(raw, self.g10_zero_raw,
                               modulo_signed16=self.g10_adc_modulo) * scale)
                 self.g10_sample_count += 1
+                packet_forces.append(force)
                 if self.raw_capture is not None:
                     self.raw_capture.add(
                         sample_ns, received_ns, packet.sequence,
@@ -763,6 +830,17 @@ class BidirectionalMotorTest(Node):
                     sample_ns, raw, force,
                     log_sample=(self.g10_sample_count %
                                 self.g10_log_decimation == 0))
+            # A median of real ADC values from one UDP packet rejects
+            # sub-packet thrust spikes. Host receipt is causal by design;
+            # do NOT use the sequence-clock newest_sample timestamp here.
+            if (len(packet_forces) >= 20 and
+                    getattr(self, "reversal_detector", None) is not None):
+                packet_force = median(packet_forces)
+                self.reversal_packet_history.append(
+                    (received_ns, packet_force))
+                for result in self.reversal_detector.observe_packet(
+                        received_ns, packet_force):
+                    self._log_result(result)
 
     def _calibration_guard(self):
         """No calibrating while spinning, armed, or while ADC stream is bad."""
@@ -800,6 +878,10 @@ class BidirectionalMotorTest(Node):
             self.last_force_ns = None
             self.force_history.clear()
             self.latency.cancel()
+            if self.reversal_detector is not None:
+                for result in self.reversal_detector.cancel("tare"):
+                    self._log_result(result)
+                self.reversal_packet_history.clear()
             self._log_event(
                 "g10_tare", mode=self.last_mode,
                 detail="zero_raw=%.6f; range=%.3f; samples=%d" %
@@ -838,11 +920,18 @@ class BidirectionalMotorTest(Node):
                 self.g10_raw_change_threshold * scale)
             self.latency.sign_threshold = (
                 self.g10_raw_sign_threshold * scale)
+            if self.reversal_detector is not None:
+                self.reversal_detector.sign_threshold = (
+                    self.g10_reversal_raw_sign_threshold * scale)
             self.g10_calibration_window.clear()
             self.last_force = None
             self.last_force_ns = None
             self.force_history.clear()
             self.latency.cancel()
+            if self.reversal_detector is not None:
+                for result in self.reversal_detector.cancel("gain_changed"):
+                    self._log_result(result)
+                self.reversal_packet_history.clear()
             self._log_event(
                 "g10_gain_calibrated", mode=self.last_mode,
                 detail=(
@@ -887,7 +976,17 @@ class BidirectionalMotorTest(Node):
             baseline_force=result.baseline,
             observed_force=(result.observed_force
                             if result.observed_force is not None else ""),
-            force_unit=self.force_unit)
+            force_unit=self.force_unit,
+            confirmed_mono_ns=(
+                result.confirmed_ns if getattr(result, "confirmed_ns", None)
+                is not None else ""),
+            from_direction=getattr(result, "from_direction", ""),
+            to_direction=getattr(result, "to_direction", ""),
+            clock_source=(
+                "g10_udp_host_receive" if
+                result.metric == "force_direction_change"
+                else "g10_estimated_sample" if self.g10_enabled
+                else "ros_force_receive"))
         if result.latency_ms is not None:
             self.get_logger().info(
                 "event %d %s: %.3f ms (%s, %s)" %
@@ -1003,6 +1102,8 @@ class BidirectionalMotorTest(Node):
                 "force_response_reference", mode=mode, dshot=wave.dshot,
                 sine=wave.sine, event_id=event_id, now_ns=send_ns,
                 direction=wave.direction,
+                reversal_from=(
+                    -wave.direction if wave.event == "reversal_command" else 0),
                 detail=("force baseline=%.6g %s" % (baseline, self.force_unit))
                 if baseline is not None else
                 "EXTERNAL_G10: collector computes latency separately"

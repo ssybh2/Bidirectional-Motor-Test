@@ -558,7 +558,7 @@ class Dashboard:
             "stop_wall_ns": None,
         }
         self.record_status.set("● 正在录制 00:00")
-        self.record_latency.set("延迟：等待第一次有效指令变化")
+        self.record_latency.set("换向延迟：等待真实正↔反指令及持续反向推力")
         self.btn_record_start.config(state="disabled")
         self.btn_record_stop.config(state="normal")
         self.btn_record_folder.config(state="disabled")
@@ -574,8 +574,7 @@ class Dashboard:
             0, (time.monotonic_ns() - session["start_ns"]) // 1_000_000_000)
         self.record_status.set(
             "● 正在录制 %02d:%02d" % (elapsed // 60, elapsed % 60))
-        # Show only authoritative, detector-produced results for this
-        # recording. Never estimate onset from the 4 Hz screen refresh.
+        # The legacy force_onset is NOT the requested reversal delay.
         latency_path = session["prefix"] + "_latency.csv"
         for row in reversed(recent_rows(latency_path, 16384)):
             try:
@@ -583,12 +582,16 @@ class Dashboard:
                           session["start_ns"])
             except (ValueError, TypeError, KeyError):
                 continue
-            if (within and row.get("metric") == "force_onset" and
-                    row.get("status") == "detected" and
-                    row.get("latency_ms")):
-                self.record_latency.set(
-                    "最近推力起效：%s ms（观测值）" %
-                    row["latency_ms"])
+            if within and row.get("metric") == "force_direction_change":
+                if (row.get("status") == "detected" and
+                        row.get("latency_ms")):
+                    self.record_latency.set(
+                        "持续反向推力延迟：%s ms（主机观测）" %
+                        row["latency_ms"])
+                else:
+                    self.record_latency.set(
+                        "反向推力：%s（无有效延迟）" %
+                        row.get("status", "unknown"))
                 break
 
     def _record_stop(self):
@@ -654,13 +657,14 @@ class Dashboard:
         self.btn_record_stop.config(state="disabled")
         self.btn_record_folder.config(state="normal")
         self.record_status.set("✓ 已保存：%s" % Path(result["path"]).name)
-        if result["onset_mean_ms"] is not None:
+        if result.get("reversal_mean_ms") is not None:
             self.record_latency.set(
-                "已测 %d 次，起效延迟均值 %.3f ms（观测值）" %
-                (result["detected"], result["onset_mean_ms"]))
+                "有效换向 %d 次，反向推力延迟均值 %.3f ms" %
+                (result["reversal_detected"],
+                 result["reversal_mean_ms"]))
         else:
             self.record_latency.set(
-                "没有有效起效延迟（已保留原始记录）")
+                "未测得持续反向推力（原始数据仍保留）")
         warnings = result.get("warnings", [])
         self._set_note(
             "实验录制已保存到：" + result["path"] +
@@ -669,12 +673,17 @@ class Dashboard:
         if not self.closing:
             summary = (
                 "文件已保存：\n%s\n\nDSHOT：%s 行，推力：%s 行\n"
-                "指令响应事件：%d；成功识别起效延迟：%d\n\n"
-                "仅为 ROS 指令发布时间到估算 G10 采样时间的观测延迟。"
+                "指令事件：%d；传统起效：%d\n"
+                "反向指令：%d；持续反向推力：%d\n\n"
+                "起点是第一条相反非零 DSHOT；终点是持续"
+                "200ms 的目标方向推力首次包接收时间。"
+                "该延迟包含 G10/UDP 测量链，非硬件同步电机时延。"
                 % (result["path"],
                    result["counts"]["command"],
                    result["counts"]["force"],
-                   result["events"], result["detected"]))
+                   result["events"], result["detected"],
+                   result.get("reversal_events", 0),
+                   result.get("reversal_detected", 0)))
             if warnings:
                 summary += ("\n\n数据完整性警告：\n" +
                             "\n".join(warnings[:4]))

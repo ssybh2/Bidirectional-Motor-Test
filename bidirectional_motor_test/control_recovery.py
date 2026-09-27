@@ -81,10 +81,25 @@ def recent_control_metadata(directory, now_ns, lookback_ns=2_000_000_000):
                 command["mode"] != "SINE" or command["dshot"] == 0 or
                 command["direction"] not in (-1, 1)):
             continue
+        detail = str(row.get("detail", ""))
+        transition = {}
+        for token in detail.split():
+            if token.startswith(("reversal_from=", "reversal_to=")):
+                key, _, value = token.partition("=")
+                try:
+                    transition[key] = int(value)
+                except ValueError:
+                    continue
+        frm = transition.get("reversal_from", 0)
+        is_reversal = (
+            frm in (-1, 1) and frm == -command["direction"] and
+            transition.get("reversal_to") == command["direction"])
         results.append((stamp, 1, {
             "type": "reference", "mono_ns": stamp,
             "mode": command["mode"], "dshot": command["dshot"],
             "sine": command["sine"], "direction": command["direction"],
             "control_event_id": event_id, "source": "control_csv",
+            "reversal": is_reversal,
+            "from_direction": frm if is_reversal else 0,
         }))
     return prefix, [item for _, _, item in sorted(results, key=lambda x: x[:2])]
