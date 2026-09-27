@@ -14,8 +14,8 @@ class DesktopDataTests(unittest.TestCase):
     def test_follows_newest_session_and_detects_stale_data(self):
         with tempfile.TemporaryDirectory() as folder:
             d = Path(folder)
-            one = d / "test_001_force.csv"
-            two = d / "test_002_force.csv"
+            one = d / "g10_001_force.csv"
+            two = d / "g10_002_force.csv"
             self.assertIsNone(latest_session(d))
             one.write_text(
                 "mono_ns,raw_force,forward_positive_force,force_unit,last_dshot\n"
@@ -31,13 +31,16 @@ class DesktopDataTests(unittest.TestCase):
 
     def test_command_heartbeat_attaches_even_when_g10_is_offline(self):
         with tempfile.TemporaryDirectory() as folder:
-            prefix = str(Path(folder) / "test_live")
+            prefix = str(Path(folder) / "g10_live")
             Path(prefix + "_force.csv").write_text(
                 "mono_ns,raw_force,forward_positive_force,force_unit,last_dshot\n")
-            command = Path(prefix + "_command.csv")
-            command.write_text("mono_ns,dshot\n100,0\n")
-            os.utime(command, ns=(2 * 10**9, 2 * 10**9))
+            quality = Path(prefix + "_g10_quality.csv")
+            quality.write_text("mono_ns,stream_ready\n100,0\n")
+            os.utime(quality, ns=(2 * 10**9, 2 * 10**9))
             self.assertTrue(acquisition_fresh(prefix, now=2.0))
+            control = str(Path(folder) / "control_only")
+            Path(control + "_command.csv").write_text("mono_ns\n10\n")
+            self.assertFalse(acquisition_fresh(control, now=2.0))
             self.assertFalse(stream_fresh(prefix, now=2.0))
             self.assertFalse(acquisition_fresh(prefix, now=10.0))
 

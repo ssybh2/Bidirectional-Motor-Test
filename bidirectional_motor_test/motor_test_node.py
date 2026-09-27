@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import json
 import math
 import queue
+import sys
 import time
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, String
 from std_srvs.srv import Trigger
 from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 
@@ -27,8 +30,10 @@ from .session_logs import SessionLogs
 
 
 class BidirectionalMotorTest(Node):
-    def __init__(self):
-        super().__init__("bidirectional_motor_test")
+    def __init__(self, acquisition_only=False):
+        super().__init__(
+            "g10_acquisition" if acquisition_only else "bidirectional_motor_test")
+        self.acquisition_only = bool(acquisition_only)
         defaults = {
             "input_topic": "/ecat/sn2555957/app1/read",
             "output_topic": "/ecat/sn2555957/app2/write",
@@ -86,11 +91,13 @@ class BidirectionalMotorTest(Node):
             "g10_raw_pre_sec": 0.25,
             "g10_raw_post_sec": 0.75,
             "log_directory": "~/bidirectional/measurements",
+            "command_meta_topic": "/bidirectional_motor_test/command_meta",
         }
         for key, value in defaults.items():
             self.declare_parameter(key, value)
         p = {key: self.get_parameter(key).value for key in defaults}
 
+        self.command_meta_topic = str(p["command_meta_topic"])
         self.channel = int(p["motor_channel"])
         self.rc_timeout_ns = int(float(p["rc_timeout_sec"]) * 1e9)
         self.force_max_age_ns = int(float(p["force_sample_max_age_sec"]) * 1e9)
@@ -152,6 +159,11 @@ class BidirectionalMotorTest(Node):
             raise ValueError("run_reentry_pause_sec must be >= 0")
         if self.force_forward_sign not in (-1, 1):
             raise ValueError("force_forward_sign must be +1 or -1")
+        if self.acquisition_only and not self.g10_enabled:
+            raise ValueError("G10 acquisition must enable g10_udp_enabled")
+        if not self.acquisition_only and self.g10_enabled:
+            raise ValueError(
+                "Motor Test cannot bind G10 UDP; start G10 from the GUI")
         if self.g10_enabled and self.force_topic:
             raise ValueError("use either force_topic or direct G10 UDP, not both")
         if self.g10_adc_channel not in range(8):
@@ -236,7 +248,9 @@ class BidirectionalMotorTest(Node):
             timeout_sec=float(p["force_latency_timeout_sec"]),
         )
         self.interlock = SwitchInterlock()
-        self.logs = SessionLogs(str(p["log_directory"]), self.force_unit)
+        self.logs = SessionLogs(
+            str(p["log_directory"]), self.force_unit,
+            prefix_tag="g10" if self.acquisition_only else "control")
         self.raw_capture = (
             RawWindowRecorder(
                 self.logs.prefix, self.g10_sample_period_ns,
@@ -250,6 +264,9 @@ class BidirectionalMotorTest(Node):
         self.rpm_below_since_ns = None
         self.last_force = None
         self.last_force_ns = None
+        self.force_history = deque(maxlen=30000)
+        self.last_remote_command_rx_ns = None
+        self.last_remote_command_ns = None
         self.last_command = 0
         self.last_mode = None
         self.last_wave_stopped_ns = None
@@ -270,21 +287,33 @@ class BidirectionalMotorTest(Node):
         self.g10_last_unready = None
         self.g10_timestamp_regressions = 0
 
-        self.publisher = self.create_publisher(
-            WriteDSHOT, str(p["output_topic"]), qos_profile_sensor_data)
-        self.rc_sub = self.create_subscription(
-            ReadDJIRC, str(p["input_topic"]), self._on_rc,
-            qos_profile_sensor_data)
+        self.publisher = None
+        self.command_pub = None
+        self.command_sub = None
+        self.rc_sub = None
         self.force_sub = None
-        if self.force_topic:
-            self.force_sub = self.create_subscription(
-                Float64, self.force_topic, self._on_force,
-                qos_profile_sensor_data)
         self.rpm_sub = None
-        if self.rpm_topic:
-            self.rpm_sub = self.create_subscription(
-                Float64, self.rpm_topic, self._on_rpm,
+        if self.acquisition_only:
+            # Collector is read-only. It must NEVER publish DSHOT.
+            self.command_sub = self.create_subscription(
+                String, self.command_meta_topic, self._on_control_meta,
                 qos_profile_sensor_data)
+        else:
+            self.publisher = self.create_publisher(
+                WriteDSHOT, str(p["output_topic"]), qos_profile_sensor_data)
+            self.command_pub = self.create_publisher(
+                String, self.command_meta_topic, qos_profile_sensor_data)
+            self.rc_sub = self.create_subscription(
+                ReadDJIRC, str(p["input_topic"]), self._on_rc,
+                qos_profile_sensor_data)
+            if self.force_topic:
+                self.force_sub = self.create_subscription(
+                    Float64, self.force_topic, self._on_force,
+                    qos_profile_sensor_data)
+            if self.rpm_topic:
+                self.rpm_sub = self.create_subscription(
+                    Float64, self.rpm_topic, self._on_rpm,
+                    qos_profile_sensor_data)
 
         self.g10_tare_service = None
         self.g10_calibrate_service = None
@@ -310,17 +339,24 @@ class BidirectionalMotorTest(Node):
         else:
             self.g10_timer = None
 
-        self.timer = self.create_timer(1.0 / rate, self._tick)
-        self._publish(0, "STARTUP", 0.0, 0, 0.0)
-        self.get_logger().info(
-            "DJIRC=%s, DSHOT=%s, force=%s, rpm=%s, CSV=%s" %
-            (p["input_topic"], p["output_topic"],
-             self.force_topic or "(not connected)",
-             self.rpm_topic or "(not connected)", self.logs.prefix))
-        self.get_logger().warn(
-            "3D ESC mode required. Switch 2=DISARM, 3=ARMED at zero output, "
-            "1=SINE. No rotor-stop guarantee without RPM feedback. "
-            "Never treat ROS alone as an emergency stop.")
+        self.timer = self.create_timer(
+            1.0 / rate,
+            self._capture_tick if self.acquisition_only else self._tick)
+        if self.acquisition_only:
+            self.get_logger().info(
+                "G10 acquisition ONLY (no DSHOT publisher); metadata=%s CSV=%s"
+                % (self.command_meta_topic, self.logs.prefix))
+        else:
+            self._publish(0, "STARTUP", 0.0, 0, 0.0)
+            self.get_logger().info(
+                "DJIRC=%s, DSHOT=%s, force=%s, rpm=%s, CSV=%s" %
+                (p["input_topic"], p["output_topic"],
+                 self.force_topic or "(not connected)",
+                 self.rpm_topic or "(not connected)", self.logs.prefix))
+            self.get_logger().warn(
+                "CONTROL ONLY: G10 is independently GUI-operated; G10 loss "
+                "does NOT stop DSHOT. Use independent physical ESC stop "
+                "and actual RPM stopping interlock for reversal.")
         if self.g10 is not None:
             self.get_logger().info(
                 "G10 ADC signed16 modulo relative correction=%s "
@@ -333,12 +369,113 @@ class BidirectionalMotorTest(Node):
                  "zero=%.3f" % self.g10_zero_raw))
 
     def _log_event(self, kind, mode="", dshot=0, sine=0.0, detail="",
-                   event_id=0, now_ns=None):
+                   event_id=0, now_ns=None, direction=0):
+        now_ns = time.monotonic_ns() if now_ns is None else now_ns
         self.logs.write(
-            "event", wall_ns=time.time_ns(),
-            mono_ns=time.monotonic_ns() if now_ns is None else now_ns,
+            "event", wall_ns=time.time_ns(), mono_ns=now_ns,
             event_id=event_id, kind=kind, mode=mode,
             dshot=dshot, sine=round(sine, 7), detail=detail)
+        if kind == "force_response_reference" and not getattr(
+                self, "acquisition_only", False):
+            self._relay_command({
+                "type": "reference", "mono_ns": now_ns, "mode": mode,
+                "dshot": dshot, "sine": sine, "direction": direction,
+                "control_event_id": event_id})
+
+    def _relay_command(self, payload):
+        publisher = getattr(self, "command_pub", None)
+        if publisher is None:
+            return
+        try:
+            publisher.publish(String(data=json.dumps(
+                payload, separators=(",", ":"), allow_nan=False)))
+        except Exception as exc:
+            # Measurement transport failure must not affect motor commands.
+            if rclpy.ok():
+                self.get_logger().warn(
+                    "Measurement command metadata failed: %s" % exc)
+
+    def _capture_tick(self):
+        now = time.monotonic_ns()
+        for result in self.latency.expire(now):
+            self._log_result(result)
+
+    def _on_control_meta(self, msg):
+        """Use the same-host controller t0; replay buffered G10 ADC samples."""
+        if not self.acquisition_only:
+            return
+        try:
+            event = json.loads(msg.data)
+            kind = event["type"]
+            stamp = int(event["mono_ns"])
+            now = time.monotonic_ns()
+            # monotonic timestamps from separate hosts are not comparable.
+            if stamp <= 0 or stamp > now + 50_000_000 or (
+                    now - stamp > 1_000_000_000):
+                return
+            if kind == "command":
+                value = int(event["dshot"])
+                mode = str(event["mode"])
+                direction = int(event["direction"])
+                if not 0 <= value <= 2047 or direction not in (-1, 0, 1):
+                    return
+                if (self.last_remote_command_ns is not None and
+                        stamp <= self.last_remote_command_ns):
+                    return
+                self.last_remote_command_ns = stamp
+                self.last_remote_command_rx_ns = now
+                self.last_command = value
+                self.last_mode = mode
+                self.logs.write(
+                    "command", wall_ns=int(event["wall_ns"]),
+                    mono_ns=stamp, mode=mode, channel=int(event["channel"]),
+                    dshot=value, sine=float(event["sine"]),
+                    logical_direction=direction,
+                    phase_rad=float(event["phase"]),
+                    last_force=self.last_force if self.last_force is not None else "",
+                    force_unit=self.force_unit)
+            elif kind == "reference":
+                if (self.last_remote_command_ns != stamp
+                        or self.last_mode != "SINE" or
+                        self.last_command == 0):
+                    return
+                direction = int(event["direction"])
+                if direction not in (-1, 1):
+                    return
+                self.event_id += 1
+                eid = self.event_id
+                if self.raw_capture is not None and not (
+                        self.raw_capture.trigger(eid, stamp)):
+                    self.get_logger().warn(
+                        "G10 native event buffer full: %d" % eid)
+                baseline = None
+                for ns, force in reversed(self.force_history):
+                    if ns <= stamp:
+                        if stamp - ns <= self.force_max_age_ns:
+                            baseline = force
+                        break
+                self._log_event(
+                    "force_response_reference",
+                    mode=str(event["mode"]), dshot=int(event["dshot"]),
+                    sine=float(event["sine"]), now_ns=stamp, event_id=eid,
+                    detail=(
+                        "force baseline=%.6g %s; controller_event=%d" %
+                        (baseline, self.force_unit,
+                         int(event["control_event_id"]))
+                        if baseline is not None else
+                        "NO_RECENT_FORCE: latency unavailable"))
+                if baseline is not None:
+                    for result in self.latency.start(
+                            eid, stamp, direction, baseline):
+                        self._log_result(result)
+                    # ROS metadata may arrive AFTER the response samples.
+                    for ns, force in tuple(self.force_history):
+                        if ns > stamp:
+                            for result in self.latency.observe(ns, force):
+                                self._log_result(result)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            self.get_logger().warn(
+                "Ignored malformed measurement metadata: %s" % exc)
 
     def _on_rc(self, msg):
         self.rc = msg
@@ -382,6 +519,7 @@ class BidirectionalMotorTest(Node):
             return
         self.last_force = signed_force
         self.last_force_ns = now
+        self.force_history.append((now, signed_force))
         if log_sample:
             wall_offset = time.time_ns() - time.monotonic_ns()
             self.logs.write(
@@ -392,7 +530,14 @@ class BidirectionalMotorTest(Node):
             self._log_result(result)
 
     def _on_g10_data_fault(self, reason):
-        """Immediately command zero and revoke arm authorization."""
+        """Collector faults never change motor control or publish DSHOT."""
+        if getattr(self, "acquisition_only", False):
+            self.latency.cancel()
+            self._log_event("g10_data_fault", mode="G10_UNREADY",
+                            detail=reason)
+            self.get_logger().warn(
+                "G10 fault: %s; independent Motor Test NOT stopped." % reason)
+            return
         self.interlock.fault()
         self.latency.cancel()
         if self.wave.running:
@@ -547,6 +692,15 @@ class BidirectionalMotorTest(Node):
         """No calibrating while spinning, armed, or while ADC stream is bad."""
         if not self.g10_enabled or self.g10 is None:
             raise CalibrationError("direct G10 UDP is disabled")
+        if getattr(self, "acquisition_only", False):
+            if (self.last_remote_command_rx_ns is None or
+                    time.monotonic_ns() - self.last_remote_command_rx_ns >
+                    self.rc_timeout_ns):
+                raise CalibrationError(
+                    "Motor Test heartbeat missing/stale; cannot confirm DISARM")
+            if self.last_mode != "DISARM" or self.last_command != 0:
+                raise CalibrationError(
+                    "Motor Test must be DISARM (switch 2), DSHOT 0")
         if self.last_command != 0 or self.wave.running:
             raise CalibrationError("stop the motor first (DSHOT must be 0)")
         if self.last_mode not in ("DISARM", "WAIT_FOR_RC"):
@@ -568,6 +722,7 @@ class BidirectionalMotorTest(Node):
             self.g10_calibration_window.clear()
             self.last_force = None
             self.last_force_ns = None
+            self.force_history.clear()
             self.latency.cancel()
             self._log_event(
                 "g10_tare", mode=self.last_mode,
@@ -610,6 +765,7 @@ class BidirectionalMotorTest(Node):
             self.g10_calibration_window.clear()
             self.last_force = None
             self.last_force_ns = None
+            self.force_history.clear()
             self.latency.cancel()
             self._log_event(
                 "g10_gain_calibrated", mode=self.last_mode,
@@ -674,13 +830,18 @@ class BidirectionalMotorTest(Node):
         send_ns = time.monotonic_ns()
         self.publisher.publish(msg)
         self.last_command = value
+        wall_ns = time.time_ns()
         self.logs.write(
-            "command", wall_ns=time.time_ns(), mono_ns=send_ns,
+            "command", wall_ns=wall_ns, mono_ns=send_ns,
             mode=mode, channel=self.channel, dshot=value,
             sine=round(sine, 7), logical_direction=direction,
             phase_rad=round(phase, 7),
             last_force=self.last_force if self.last_force is not None else "",
             force_unit=self.force_unit)
+        self._relay_command({
+            "type": "command", "mono_ns": send_ns, "wall_ns": wall_ns,
+            "mode": mode, "dshot": value, "channel": self.channel,
+            "sine": sine, "direction": direction, "phase": phase})
         return send_ns
 
     def _tick(self):
@@ -765,10 +926,13 @@ class BidirectionalMotorTest(Node):
             self._log_event(
                 "force_response_reference", mode=mode, dshot=wave.dshot,
                 sine=wave.sine, event_id=event_id, now_ns=send_ns,
+                direction=wave.direction,
                 detail=("force baseline=%.6g %s" % (baseline, self.force_unit))
                 if baseline is not None else
+                "EXTERNAL_G10: collector computes latency separately"
+                if not self.g10_enabled and not self.force_topic else
                 "NO_RECENT_FORCE: latency unavailable")
-            if baseline is None:
+            if baseline is None and (self.g10_enabled or self.force_topic):
                 self.get_logger().warn(
                     "event %d: no recent force on %s; latency unavailable" %
                     (event_id, self.force_topic or "(force_topic is empty)"))
@@ -784,10 +948,11 @@ class BidirectionalMotorTest(Node):
         # Do NOT assume these best-effort publishes are a hardware stop.
         self.wave.stop()
         try:
-            if not rclpy.ok():
-                self.get_logger().warn(
-                    "ROS context is already invalid; cannot publish shutdown "
-                    "DSHOT 0. Use the independent physical ESC stop.")
+            if getattr(self, "acquisition_only", False):
+                pass  # Stopping GUI acquisition MUST NOT publish DSHOT.
+            elif not rclpy.ok():
+                print("ROS context invalid: shutdown DSHOT 0 unavailable. "
+                      "Use independent physical ESC stop.", file=sys.stderr)
             else:
                 for _ in range(10):
                     if not rclpy.ok():
@@ -795,9 +960,8 @@ class BidirectionalMotorTest(Node):
                     try:
                         self._publish(0, "SHUTDOWN", 0.0, 0, 0.0)
                     except Exception as exc:
-                        self.get_logger().warn(
-                            "Shutdown zero publish failed (%s); physical ESC "
-                            "stop is required." % exc)
+                        print("Shutdown DSHOT 0 failed: %s; physical ESC "
+                              "stop required." % exc, file=sys.stderr)
                         break
                     time.sleep(0.01)
         finally:
@@ -813,14 +977,18 @@ class BidirectionalMotorTest(Node):
                     self.logs.close()
 
 
-def main(args=None):
+def main(args=None, acquisition_only=False):
     rclpy.init(args=args)
     node = None
     try:
-        node = BidirectionalMotorTest()
+        node = BidirectionalMotorTest(acquisition_only=acquisition_only)
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except RuntimeError:
+        # Humble can raise from a subscription after SIGINT tears DDS down.
+        if rclpy.ok():
+            raise
     finally:
         try:
             if node is not None:
@@ -831,6 +999,10 @@ def main(args=None):
         finally:
             if rclpy.ok():
                 rclpy.shutdown()
+
+
+def acquisition_main(args=None):
+    return main(args=args, acquisition_only=True)
 
 
 if __name__ == "__main__":

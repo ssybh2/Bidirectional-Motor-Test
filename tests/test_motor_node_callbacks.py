@@ -5,6 +5,7 @@ Hardware, real DDS, UDP startup and physical timing are NOT covered.
 """
 
 import importlib
+from collections import deque
 import queue
 import sys
 import tempfile
@@ -54,6 +55,7 @@ class NodeTickTests(unittest.TestCase):
         node.g10_zero_count = 100
         node.g10_auto_zero_samples = 100
         node.g10_last_unready = None
+        node.force_history = deque()
         node.rc = types.SimpleNamespace(online=1, right_switch=1)
         node.rc_received_ns = time.monotonic_ns()
         node.rc_timeout_ns = 250_000_000

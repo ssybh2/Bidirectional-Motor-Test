@@ -50,10 +50,10 @@ bash ~/bidirectional/Bidirectional-Motor-Test/scripts/install_g10_desktop.sh
 
 ## 3. 启动与录制
 
-1. **保持 ESC 动力断开、测试台空载**，关闭其他监听 UDP 4800 的程序；打开 GUI →「启动采集」→等待数据状态正常。
+1. **保持 ESC 动力断开、测试台空载**。Motor Test 不再自动占用 UDP 4800；打开 GUI →「启动采集」才启动独立 G10 进程。
 2. 空载静止后点击「空载去皮」；使用真实已知砝码时才能执行「砝码标定」（单位才会切换为 `kgf`）。可先轻推/轻拉验证正负曲线。
 3. 在「实验录制」中**选择保存目录 → 开始录制 → 结束并保存**。默认写入 `~/bidirectional/recordings/` 下的 ZIP；内含 `command.csv`、`force.csv`、`timeline.csv`、`event_summary.csv`、`latency.csv` 和采集质量/说明文件。原始连续日志保存在 `~/bidirectional/measurements/`。
-4. 如果需要实际 DSHOT 指令测试，**先另行启动并验证 EtherCAT 主站**；本 GUI 不会启动主站或替代硬件急停。配置中默认遥控器话题 `/ecat/sn2555957/app1/read`、DSHOT 话题 `/ecat/sn2555957/app2/write`，设备 SN 不同须先修改 [config/motor_test.yaml](config/motor_test.yaml) 并重新编译。原控制安全顺序为遥控器 **2 → 3 → 1**；带桨反转前仍需真实 RPM 停转联锁与独立断电急停。
+4. 如果需要实际 DSHOT 指令测试，**另行启动并验证 EtherCAT 主站与 Motor Test**；本 GUI 只启动、停止 G10 采集，绝不会启动或停止电机控制。配置中默认遥控器话题 `/ecat/sn2555957/app1/read`、DSHOT 话题 `/ecat/sn2555957/app2/write`，设备 SN 不同须先修改 [config/motor_test.yaml](config/motor_test.yaml) 并重新编译。原控制安全顺序为遥控器 **2 → 3 → 1**；带桨反转前仍需真实 RPM 停转联锁与独立断电急停。
 
 **延迟含义**：报告的是 ROS DSHOT **发布时刻 → G10 估算的推力采样时刻**，不是硬件同步的纯电机延迟；G10 内部缓存、网络和调度误差仍需单独标定。没有有效推力响应时结果标记为未确定，不会写成 `0 ms`。
 
@@ -108,9 +108,42 @@ bash /home/hby/bidirectional/Bidirectional-Motor-Test/scripts/launch_g10_desktop
 
 如果 Motor Test 确实必须以 root 运行，先确保 `/home/hby/bidirectional/measurements` 及 CSV **对 hby 可读**，标定目录也有合适的共享写权限。历史上由 root 建立的目录可能无法让普通用户创建新会话，务必停机后检查所有权；不要以 root 启动图形界面。正常情况下 DDS 消息订阅/发布本身不需要 root，两端仍须使用同一 ROS_DOMAIN_ID 与兼容的 RMW 环境。
 
-GUI 在点击「启动采集」时，会立即扫描共享目录的 **command.csv 心跳**，即使 G10 正在归零或暂时无力数据，也会附着现有节点而不再次启动。若 UDP 已占用且找不到可读心跳，会明确提示检查 `CSV=` 路径与 `sudo ss -lunp | grep ':4800'`，不会尝试抢占端口。采集进程必须唯一：不要同时运行 g10_probe 或另一套绑定 4800 的厂商软件。
+GUI 在点击「启动采集」时，只检查 **g10_*_g10_quality.csv** 采集心跳；Motor Test 的控制心跳不再阻止独立采集。若 UDP 已占用且找不到采集心跳，会提示检查 `sudo ss -lunp | grep ':4800'`，不会尝试抢占端口。采集进程必须唯一：不要同时运行 g10_probe 或另一套绑定 4800 的厂商软件。
 
 `ros2 run` **绕过了上述 launch 参数覆盖**；若直接运行，请显式指定绝对路径 `log_directory` 和 `g10_calibration_file`，避免再次遇到 root/普通用户 HOME 不一致。
 
 Ctrl+C 后 ROS 2 可能先销毁 DDS 上下文，使最后的 DSHOT 0 **无法发出**。现在退出时会检测上下文、捕获发布异常并继续释放 UDP 与 CSV，但这只解决退出异常，**不构成物理急停，也不保证电机已停转**。请使用独立物理 ESC 动力切断及下位机失联清零措施。
 
+
+## 6. GUI 手动采集与电机控制独立运行
+
+新版 `motor_test.launch.py` 只负责 `/bidirectional_motor_test` 遥控器与 DSHOT 控制，它不绑定 UDP 4800，也不自动去皮或自动开启 G10 采集。它额外发布 `/bidirectional_motor_test/command_meta`，提供同一主机单调时钟下的 DSHOT 发布时间、正弦状态和首次换向事件。它仍遵守原来的 RC 2 → 3 → 1 解锁顺序以及可选 RPM 停转联锁。
+
+**只有 GUI「启动采集」才启动 `g10_capture.launch.py` 中的 `/g10_acquisition`。** 采集进程负责 UDP 4800、G10 ADC/自动归零、CSV、标定服务、指令与推力关联。GUI「停止采集」只退出该进程，Motor Test 仍然继续控制电机。GUI 只显示 `g10_...` 测量会话，控制日志另存为 `control_...`，不再将控制日志当成采集心跳。
+
+```bash
+# 更新代码后，普通用户编译：
+cd /home/hby/bidirectional/Bidirectional-Motor-Test
+git switch g10-linux-udp
+git pull --ff-only origin g10-linux-udp
+cd /home/hby/bidirectional
+source /opt/ros/humble/setup.bash
+source /home/hby/one/install/setup.bash
+colcon build --symlink-install --packages-select bidirectional_motor_test
+
+# 已有正常 EtherCAT 主站的前提下，在独立控制终端（可保持现有 root 方式）：
+source /opt/ros/humble/setup.bash
+source /home/hby/one/install/setup.bash
+source /home/hby/bidirectional/install/setup.bash
+ros2 launch bidirectional_motor_test motor_test.launch.py
+
+# Ubuntu 普通用户打开 GUI，窗口出现时尚未启动采集：
+bash /home/hby/bidirectional/Bidirectional-Motor-Test/scripts/launch_g10_desktop.sh
+# 点击「启动采集」后才会有 UDP 4800 接收。
+```
+
+单独检查采集进程也可以在另一普通用户终端运行 `ros2 launch bidirectional_motor_test g10_capture.launch.py`，但 **GUI 只能停止由 GUI 自己启动的采集进程**。标定服务改为 `/g10_acquisition/g10_tare`、`/g10_acquisition/g10_calibrate`；必须收到来自 Motor Test 的新鲜 `DISARM` 和 DSHOT 0 心跳，仍须切断 ESC 动力并使用实际已知载荷。采集和控制必须运行在**同一台 Ubuntu 主机**上，因为 Linux `monotonic_ns` 跨主机不能直接比较；各 ROS 进程也须使用兼容的 `ROS_DOMAIN_ID` / RMW 环境。
+
+采集服务用指令元数据中的原始发布时刻，与缓存的 G10 原生样本做时间关联。元数据缺失、推力基线不新鲜时**不伪造测量结果**，现有 CSV/ZIP 导出格式保持不变。
+
+**安全变化：** 现在 G10 数据中断或 GUI 停止采集 **不会令 Motor Test 停机**。GUI 的「停止采集」不是急停，正式带桨测试必须具备独立物理急停、RPM 停转联锁和下位机失联清零措施。Ctrl+C 时若 ROS 上下文已失效，软件也无法保证最后的 DSHOT 0 已发布。

@@ -43,7 +43,8 @@ bidirectional_motor_test:
     # Reverse-engineered DET G10X.322 Ethernet stream. The Ubuntu G10 NIC must
     # be 192.168.127.55/24; the test bench sends from 192.168.127.56:5000 to
     # UDP port 4800. Use a second NIC -- never share the EtherCAT NIC.
-    g10_udp_enabled: true
+    # G10 reception is GUI-owned; Motor Test never binds UDP 4800.
+    g10_udp_enabled: false
     g10_bind_host: "0.0.0.0"
     g10_udp_port: 4800
     g10_device_ip: "192.168.127.56"
@@ -78,7 +79,8 @@ bidirectional_motor_test:
     # Ubuntu UDP stream health: block sine output until a calibrated/raw
     # fresh G10 stream is available, including auto-zero completion.
     # Set false ONLY for non-powered/no-prop command-path debugging.
-    g10_require_healthy: true
+    # Control is independent of G10; hardware/RPM stops remain essential.
+    g10_require_healthy: false
     g10_no_packet_timeout_sec: 0.15
     g10_poll_rate_hz: 100.0
     g10_max_packets_per_poll: 6
@@ -94,3 +96,4 @@ bidirectional_motor_test:
     # ros2 launch resolves this from the installed colcon workspace, never
     # from root's HOME. For direct ros2 run, override this parameter yourself.
     log_directory: "~/bidirectional/measurements"
+    command_meta_topic: "/bidirectional_motor_test/command_meta"

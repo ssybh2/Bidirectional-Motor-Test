@@ -1,0 +1,43 @@
+# GUI-owned, read-only G10 acquisition (NEVER publishes DSHOT).
+g10_acquisition:
+  ros__parameters:
+    command_meta_topic: "/bidirectional_motor_test/command_meta"
+    publish_rate_hz: 50.0
+    rc_timeout_sec: 0.25
+    motor_channel: 1
+    force_topic: ""
+    force_unit: "raw_count"
+    force_sample_max_age_sec: 0.25
+    force_confirm_samples: 10
+    force_latency_timeout_sec: 5.0
+    g10_udp_enabled: true
+    g10_bind_host: "0.0.0.0"
+    g10_udp_port: 4800
+    g10_device_ip: "192.168.127.56"
+    g10_adc_channel: 6
+    g10_sample_period_ns: 100000
+    g10_arrival_bias_ns: 0
+    g10_auto_zero: true
+    g10_auto_zero_samples: 10000
+    g10_zero_raw: 0.0
+    g10_force_sign: -1
+    g10_adc_signed16_modulo: true
+    g10_kgf_per_count: 0.0
+    g10_load_calibration: true
+    g10_calibration_file: "~/bidirectional/calibration/g10_channel6.json"
+    g10_calibration_mass_kg: 0.0
+    g10_stability_range_counts: 10.0
+    g10_calibration_window_sec: 1.0
+    g10_raw_change_threshold: 50.0
+    g10_raw_sign_threshold: 50.0
+    g10_log_decimation: 40
+    g10_channel_log_decimation: 4
+    g10_require_healthy: false
+    g10_no_packet_timeout_sec: 0.15
+    g10_poll_rate_hz: 100.0
+    g10_max_packets_per_poll: 6
+    g10_max_queue_backlog: 24
+    g10_capture_raw_events: true
+    g10_raw_pre_sec: 0.25
+    g10_raw_post_sec: 0.75
+    log_directory: "~/bidirectional/measurements"

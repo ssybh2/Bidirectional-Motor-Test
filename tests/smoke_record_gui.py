@@ -20,7 +20,7 @@ def main():
     with tempfile.TemporaryDirectory() as home:
         folder = Path(home)
         with mock.patch.object(g10_gui, "LOG_DIR", folder):
-            logs = SessionLogs(folder, "raw_count")
+            logs = SessionLogs(folder, "raw_count", prefix_tag="g10")
             try:
                 initial = time.monotonic_ns()
                 logs.write(

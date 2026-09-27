@@ -7,11 +7,13 @@ from pathlib import Path
 
 
 class SessionLogs:
-    def __init__(self, directory, force_unit):
+    def __init__(self, directory, force_unit, prefix_tag="test"):
+        if prefix_tag not in ("test", "control", "g10"):
+            raise ValueError("unsupported session prefix")
         path = Path(os.path.expanduser(directory))
         path.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-        prefix = path / ("test_" + stamp + "_" + str(os.getpid()))
+        prefix = path / (prefix_tag + "_" + stamp + "_" + str(os.getpid()))
         self.force_unit = force_unit
         self.handles = []
         self.writers = {}

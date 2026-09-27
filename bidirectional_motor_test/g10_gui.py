@@ -45,7 +45,7 @@ GREEN = "#6cdda4"
 AMBER = "#efca76"
 RED = "#fa8887"
 FONT = "Noto Sans CJK SC"
-ROS_NODE = "/bidirectional_motor_test"
+ROS_NODE = "/g10_acquisition"
 LOG_DIR = Path(os.environ.get(
     "G10_LOG_DIR", "~/bidirectional/measurements")).expanduser()
 REPO_DIR = Path(os.environ.get(
@@ -400,7 +400,7 @@ class Dashboard:
                     self.mode_value.set(mode.get("mode", "—"))
                 if not healthy and self.own_proc is None:
                     self._set_note(
-                        "最近会话已停止；点击“启动采集”，或运行原 ROS 节点。")
+                        "最近 G10 会话已停止；点击“启动采集”，Motor Test 独立运行。")
             if self.own_proc is not None and self.own_proc.poll() is not None:
                 code = self.own_proc.returncode
                 self.own_proc = None
@@ -646,10 +646,10 @@ class Dashboard:
         if active is not None and acquisition_fresh(active):
             self.prefix = active
             self._set_note(
-                "已附着现有 ROS 控制/采集节点；"
-                "不会重复启动进程或绑定 UDP 4800。")
+                "已附着现有 G10 采集进程；Motor Test 独立运行。"
+                "不会重复绑定 UDP 4800。")
             return
-        # A stale CSV is not proof the UDP port is free. Protect other apps.
+        # A stale G10 CSV is not proof UDP is free; do not start duplicates.
         try:
             test = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
@@ -659,8 +659,8 @@ class Dashboard:
         except OSError as exc:
             messagebox.showerror(
                 "UDP 端口已占用",
-                "UDP 4800 已被占用，但没有在共享目录发现新鲜的控制日志。\n"
-                "如果 ROS 节点已运行，请检查它的 CSV= 路径与 GUI 目录一致：\n"
+                "UDP 4800 已被占用，但没有发现 G10 采集日志。\n"
+                "新版 Motor Test 不绑定此端口；请检查旧进程或 g10_probe。\n"
                 "%s\n请勿启动第二个采集进程。可使用 "
                 "sudo ss -lunp | grep ':4800' 检查进程。\n%s"
                 % (LOG_DIR, exc))
@@ -684,7 +684,7 @@ class Dashboard:
             try:
                 self.own_proc = subprocess.Popen(
                     ros_command("ros2", "launch", "bidirectional_motor_test",
-                                "motor_test.launch.py"),
+                                "g10_capture.launch.py"),
                     stdin=subprocess.DEVNULL, stdout=handle,
                     stderr=subprocess.STDOUT, start_new_session=True)
             finally:
@@ -696,8 +696,8 @@ class Dashboard:
             return
         self.btn_stop.config(state="normal")
         self._set_note(
-            "已启动 ROS 采集。自动归零前保持台架空载；"
-            "G10 原始 UDP 与 EtherCAT 使用两块独立网卡。")
+            "已启动独立 G10 采集；Motor Test 不受影响。"
+            "自动归零前保持台架空载。")
 
     def _stop_owned(self):
         if self.own_proc is None or self.own_proc.poll() is not None:
@@ -705,10 +705,10 @@ class Dashboard:
                 "当前节点不是由该 GUI 启动，不能从这里停止。")
             return
         if not messagebox.askyesno(
-                "停止采集（非硬件急停）",
-                "先将遥控器置于 DISARM，切断 ESC 动力。\n\n"
-                "现在请求退出 GUI 启动的 ROS 节点吗？"
-                "此操作不是物理急停。"):
+                "停止 G10 采集",
+                "停止采集不会停止电机！\n\n"
+                "仅退出 GUI 启动的 G10 采集进程吗？"
+                "Motor Test 仍可能继续发送 DSHOT。"):
             return
         # Seal the recording interval *before* shutdown's extra zero-DSHOT
         # publishes, so the export records exactly what the user requested.
@@ -718,7 +718,7 @@ class Dashboard:
         try:
             os.killpg(self.own_proc.pid, signal.SIGINT)
             self._set_note(
-                "已请求 ROS 退出；正在等待节点发送零指令并关闭数据文件。")
+                "已请求 G10 采集进程退出，Motor Test 不受影响。")
         except ProcessLookupError:
             pass
         except OSError as exc:
@@ -823,18 +823,18 @@ class Dashboard:
             return
         if owns_running:
             question = (
-                "GUI 启动的 ROS 节点还在运行。\n"
-                "请先 DISARM 并切断 ESC 动力。\n\n"
-                "确认请求停止 ROS、保存录制并关闭界面？"
+                "GUI 启动的 G10 采集仍在运行。\n"
+                "停止采集不会停止电机！\n\n"
+                "保存录制、停止 G10 采集并关闭界面？"
                 if self.recording is not None else
-                "GUI 启动的 ROS 节点还在运行。\n"
-                "请先 DISARM 并切断 ESC 动力。\n\n"
-                "退出界面前请求停止该节点吗？")
+                "GUI 启动的 G10 采集仍在运行。\n"
+                "停止采集不会停止电机！\n\n"
+                "退出界面前停止 G10 采集吗？")
         else:
             question = (
                 "当前录制尚未保存。\n"
                 "确认结束录制并保存 ZIP，然后关闭界面？\n"
-                "其他终端启动的 ROS 节点会继续运行。")
+                "独立的 Motor Test 电机控制节点仍会运行。")
         if not messagebox.askyesno("关闭 G10 界面", question):
             return
         self.closing = True
@@ -868,9 +868,9 @@ class Dashboard:
         elif time.monotonic() > deadline:
             self.closing = False
             messagebox.showerror(
-                "ROS 节点尚未退出",
+                "G10 采集尚未退出",
                 "请先切断 ESC 动力并查看进程。"
-                "不强制杀死进程，因为这不能保证 DSHOT 硬件停止。")
+                "只管理 GUI 启动的 G10 进程，不干预 Motor Test。")
             self.root.after(250, self._refresh)
         else:
             self.root.after(150, lambda: self._finish_close(deadline))

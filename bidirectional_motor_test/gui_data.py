@@ -22,7 +22,7 @@ def latest_session(directory):
         return None
     newest = None
     stamp = -1
-    for item in root.glob("test_*_force.csv"):
+    for item in root.glob("g10_*_force.csv"):
         try:
             mtime = item.stat().st_mtime_ns
         except OSError:
@@ -94,13 +94,12 @@ def stream_fresh(prefix, max_age_sec=3.0, now=None):
 
 
 def acquisition_fresh(prefix, max_age_sec=3.0, now=None):
-    """Whether the node is publishing commands, even before G10 auto-zero.
+    """Whether the G10 receiver is alive even during auto-zero/link loss.
 
-    A live control node can publish DSHOT 0 while force.csv has only a
-    header (or G10 is offline). Avoid starting another UDP listener then.
+    The controller's command CSV is NOT evidence of G10 collection.
     """
     return _file_fresh(
-        str(prefix) + "_command.csv", max_age_sec, now)
+        str(prefix) + "_g10_quality.csv", max_age_sec, now)
 
 
 def parse_force(row):
