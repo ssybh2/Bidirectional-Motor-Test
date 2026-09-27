@@ -47,6 +47,7 @@ class SessionLogs:
             self.handles.append(handle)
             writer = csv.DictWriter(handle, fieldnames=columns)
             writer.writeheader()
+            handle.flush()  # even an untouched session has readable headers
             self.writers[kind] = writer
         self.prefix = str(prefix)
 

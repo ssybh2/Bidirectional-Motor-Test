@@ -53,7 +53,9 @@ def _read_csv(path):
             reader = csv.DictReader(stream)
             fields = reader.fieldnames
             if not fields:
-                raise ExportError("CSV header missing: %s" % path)
+                # SessionLogs can exist before its buffered header is flushed.
+                # An empty event/quality/latency stream is normal at startup.
+                return
             for row in reader:
                 if None in row or any(value is None for value in row.values()):
                     continue
