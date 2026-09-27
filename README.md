@@ -2,6 +2,41 @@
 
 运行环境：**Ubuntu 22.04 / ROS 2 Humble**。本包是 [AIMEtherCAT/EcatV2_Master](https://github.com/AIMEtherCAT/EcatV2_Master) 的上层 ROS 控制节点，不负责产生物理 DSHOT600 波形。
 
+## Ubuntu 原生图形界面（不用在终端里盯 CSV）
+
+`g10-linux-udp` 分支增加了 **G10 推力测量** 桌面应用。它使用 Ubuntu 自带的 Tk 图形库，**不依赖浏览器、matplotlib 或 Windows 软件**。可以在 Ubuntu 的“应用程序”中点击启动，主界面包含实时推力大数字、30 秒滚动曲线、DSHOT 指令、G10 接收状态，以及 **8 路尚未标定的 ADC 原始数值**；ADC6 仅标为当前推力候选通道。其他 7 路不能擅自解释为扭矩、电压、转速等物理量。
+
+它本身**不争用 UDP 4800，也不发布任何电机控制消息**：GUI 只读取已有 ROS 节点写出的 CSV。新增的 `g10_channels.csv` 每约 16 ms 保存一次八通道快照（默认每 4 个 G10 UDP 包取一个快照，约 62 Hz）；推力检测仍使用内部全部约 10 kHz 采样，`force.csv` 仍约 250 Hz。这些不同数据频率不能混为一谈。窗口上的 `去皮`、`砝码标定` 和 `查询标定` 按钮调用现有 ROS 服务，保留其 **DISARM、无动力和稳定窗口** 验证。
+
+首次需要**在 Ubuntu 上执行一次**如下命令安装图形依赖、构建 ROS 包、注册桌面图标：
+
+```bash
+sudo apt update
+sudo apt install -y python3-tk
+
+cd /home/hby/bidirectional/Bidirectional-Motor-Test
+git switch g10-linux-udp
+git pull --ff-only origin g10-linux-udp
+
+cd /home/hby/bidirectional
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-up-to bidirectional_motor_test
+
+cd /home/hby/bidirectional/Bidirectional-Motor-Test
+bash scripts/install_g10_desktop.sh
+```
+
+之后从 Ubuntu 应用列表搜索 **G10 推力测量**，点击即可打开窗口；如果桌面也生成图标，首次可能需要右键 **允许启动（Allow Launching）**。如果不想安装快捷方式，也可以在已 source 的 ROS 终端执行一次 `ros2 run bidirectional_motor_test g10_dashboard` 打开窗口，以后所有数据和操作都在 GUI 内。
+
+GUI 可以监测**已经运行的** `motor_test.launch.py`，或者点击 **启动采集** 来启动自己的 ROS 节点；它会先检查 G10 本地 IP 和 UDP 端口，避免与 `g10_probe`/其他节点争抢。点击 **停止采集** 只会关闭 GUI **自己启动的**节点，关闭窗口时也先请求该节点正常停机。对于在其他终端启动的节点，GUI 仅附着监看，不擅自停止。不要把软件停止按钮当成硬件急停。
+
+- **去皮**：先卸载、静止两秒，确保遥控器开关 2、DSHOT 0、ESC 动力断开，点击 `空载去皮`；小于几个 ADC 计数的量化波动是正常的。
+- **砝码标定**：先去皮，输入真实已知质量（kg），稳定加载后点击 `砝码标定`，成功才可切换显示为 kgf。手按未知力不能标定。
+- **查看标定**：显示零点、kgf/count 及当前静态窗口状态。单位变更时曲线自动分段，不把计数和 kgf 混绘。
+- **故障排查**：如果没有窗口，请确认 Ubuntu 图形桌面、`python3-tk`、ROS 已构建。桌面启动脚本为 `scripts/launch_g10_desktop.sh`；由 GUI 启动的 ROS 日志保存在 `~/bidirectional/measurements/g10_dashboard_ros.log`。
+
+**网络前置条件不变**：G10 专用网卡 `enp5s0` 需有 `192.168.127.55/24`，EtherCAT 使用另一块物理网卡。GUI 不会用 sudo 配网，也不会自动启动/停止 EtherCAT 主站。UDP 接收样本时间仍是基于主机收到一批数据的估计值，不是硬件同步时间戳。
+
 ## 实际连接的话题
 
 | 数据 | 话题 | ROS 消息 |

@@ -75,6 +75,7 @@ class BidirectionalMotorTest(Node):
             "g10_raw_change_threshold": 50.0,
             "g10_raw_sign_threshold": 50.0,
             "g10_log_decimation": 40,
+            "g10_channel_log_decimation": 4,
             "g10_require_healthy": True,
             "g10_no_packet_timeout_sec": 0.15,
             "g10_poll_rate_hz": 100.0,
@@ -121,6 +122,8 @@ class BidirectionalMotorTest(Node):
         self.g10_raw_sign_threshold = float(
             p["g10_raw_sign_threshold"])
         self.g10_log_decimation = int(p["g10_log_decimation"])
+        self.g10_channel_log_decimation = int(
+            p["g10_channel_log_decimation"])
         self.g10_require_healthy = bool(p["g10_require_healthy"])
         self.g10_no_packet_timeout_ns = round(
             float(p["g10_no_packet_timeout_sec"]) * 1e9)
@@ -157,8 +160,9 @@ class BidirectionalMotorTest(Node):
             raise ValueError("g10_auto_zero_samples must be >= 1")
         if self.g10_force_sign not in (-1, 1):
             raise ValueError("g10_force_sign must be +1 or -1")
-        if self.g10_kgf_per_count < 0 or self.g10_log_decimation < 1:
-            raise ValueError("G10 scale must be >= 0 and log decimation >= 1")
+        if (self.g10_kgf_per_count < 0 or self.g10_log_decimation < 1
+                or self.g10_channel_log_decimation < 1):
+            raise ValueError("G10 scale must be >= 0; decimations >= 1")
         if self.g10_no_packet_timeout_ns <= 0 or self.g10_poll_rate_hz <= 0:
             raise ValueError("G10 timeout and processing rate must be > 0")
         if self.g10_max_packets_per_poll < 1 or self.g10_max_queue_backlog < 1:
@@ -243,6 +247,7 @@ class BidirectionalMotorTest(Node):
         self.g10_zero_sum = 0.0
         self.g10_zero_count = 0
         self.g10_sample_count = 0
+        self.g10_packet_count = 0
         self.g10_last_sequence = None
         self.g10_sequence_gaps = 0
         self.g10_error_reported = False
@@ -467,6 +472,18 @@ class BidirectionalMotorTest(Node):
             timestamps = packet.sample_timestamps(
                 received_ns, self.g10_sample_period_ns,
                 self.g10_arrival_bias_ns)
+            self.g10_packet_count += 1
+            if (self.g10_packet_count %
+                    self.g10_channel_log_decimation == 0):
+                latest_channels = packet.samples[-1]
+                self.logs.write(
+                    "g10_channels",
+                    host_write_wall_ns=time.time_ns(),
+                    packet_recv_mono_ns=received_ns,
+                    estimated_sample_mono_ns=timestamps[-1],
+                    packet_sequence=packet.sequence,
+                    **{"adc_%d" % i: int(value)
+                       for i, value in enumerate(latest_channels)})
             for sample_ns, channels in zip(timestamps, packet.samples):
                 raw = float(channels[self.g10_adc_channel])
                 self.g10_calibration_window.add(sample_ns, raw)

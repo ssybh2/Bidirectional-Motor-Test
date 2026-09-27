@@ -67,6 +67,7 @@ bidirectional_motor_test:
     g10_raw_change_threshold: 50.0
     g10_raw_sign_threshold: 50.0
     g10_log_decimation: 40   # continuous force.csv ~250 Hz, event window native 10 kHz
+    g10_channel_log_decimation: 4  # eight uncalibrated ADCs ~62 Hz for GUI
     # Ubuntu UDP stream health: block sine output until a calibrated/raw
     # fresh G10 stream is available, including auto-zero completion.
     # Set false ONLY for non-powered/no-prop command-path debugging.

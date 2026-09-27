@@ -16,3 +16,29 @@ jobs:
         run: python -m compileall -q bidirectional_motor_test tests launch
       - name: Run ROS-independent logic tests
         run: python -m unittest discover -s tests -v
+      - name: Validate desktop launcher scripts
+        run: bash -n scripts/*.sh
+
+  desktop-smoke:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimal Tk and virtual display
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-tk xvfb
+      - name: Open desktop dashboard on virtual display
+        run: |
+          xvfb-run -a /usr/bin/python3 - <<'PY'
+          import tkinter as tk
+          from bidirectional_motor_test.g10_gui import Dashboard
+          root = tk.Tk()
+          app = Dashboard(root)
+          root.update_idletasks()
+          app._refresh()
+          root.update()
+          assert len(app.channel_vars) == 8
+          assert app.connection.cget("text")
+          root.destroy()
+          print("G10 Tk GUI window smoke test: passed")
+          PY

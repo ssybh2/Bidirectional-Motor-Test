@@ -23,6 +23,12 @@ class SessionLoggingTests(unittest.TestCase):
                               mode="DISARM", channel=1, dshot=0,
                               sine=0.0, logical_direction=0, phase_rad=0.0,
                               last_force="", force_unit="kgf")
+                session.write(
+                    "g10_channels", host_write_wall_ns=100,
+                    packet_recv_mono_ns=90,
+                    estimated_sample_mono_ns=89,
+                    packet_sequence=76,
+                    **{"adc_%d" % i: i + 10 for i in range(8)})
             finally:
                 session.close()
             with open(prefix + "_event.csv", newline="", encoding="utf-8") as f:
@@ -33,6 +39,12 @@ class SessionLoggingTests(unittest.TestCase):
             with open(prefix + "_command.csv", newline="", encoding="utf-8") as f:
                 commands = list(csv.DictReader(f))
             self.assertEqual(commands[0]["dshot"], "0")
+            with open(prefix + "_g10_channels.csv", newline="",
+                      encoding="utf-8") as f:
+                adc_rows = list(csv.DictReader(f))
+            self.assertEqual(len(adc_rows), 1)
+            self.assertEqual(adc_rows[0]["adc_6"], "16")
+            self.assertEqual(adc_rows[0]["packet_sequence"], "76")
 
 
 if __name__ == "__main__":

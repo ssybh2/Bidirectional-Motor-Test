@@ -32,6 +32,14 @@ class SessionLogs:
                             "sequence_gap_events", "timestamp_regressions",
                             "queue_backlog", "zero_samples",
                             "raw_windows_dropped"),
+            # One eight-channel ADC snapshot per N G10 UDP packets.
+            # Other channels remain raw/unidentified, NOT calibrated units.
+            "g10_channels": ("host_write_wall_ns",
+                              "packet_recv_mono_ns",
+                              "estimated_sample_mono_ns",
+                              "packet_sequence",
+                              "adc_0", "adc_1", "adc_2", "adc_3",
+                              "adc_4", "adc_5", "adc_6", "adc_7"),
         }
         for kind, columns in schemas.items():
             handle = open(str(prefix) + "_" + kind + ".csv",
@@ -46,7 +54,7 @@ class SessionLogs:
         self.writers[record_type].writerow(row)
         # We prefer durable, immediately inspectable measurements over disk speed
         # at the default 50 Hz command rate.
-        self.handles[("command", "force", "event", "latency", "g10_quality").index(record_type)].flush()
+        self.handles[("command", "force", "event", "latency", "g10_quality", "g10_channels").index(record_type)].flush()
 
     def close(self):
         for handle in self.handles:
