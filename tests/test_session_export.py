@@ -167,6 +167,83 @@ class RecordingExportTests(unittest.TestCase):
             self.assertEqual(summary["target_sign_status"], "timeout")
         self.assertIsNone(result["onset_mean_ms"])
 
+    def test_controller_csv_recovers_commands_and_marks_missing_latency(self):
+        # Reproduce an actual G10-only ZIP: force samples exist, but ROS
+        # command/event/latency streams on the collector are all header-only.
+        controller = SessionLogs(
+            self.path / "continuous", "raw_count", prefix_tag="control")
+        self.addCleanup(controller.close)
+        for stamp, value, direction in (
+                (120, 1100, 1), (140, 0, 0), (200, 50, -1)):
+            controller.write(
+                "command", wall_ns=3000 + stamp, mono_ns=stamp,
+                mode="SINE", channel=1, dshot=value,
+                sine=.5 if value else 0,
+                logical_direction=direction, phase_rad=.5,
+                last_force="", force_unit="raw_count")
+        controller.write(
+            "event", wall_ns=3200, mono_ns=200, event_id=3,
+            kind="force_response_reference", mode="SINE",
+            dshot=50, sine=-.5,
+            detail="EXTERNAL_G10: collector computes latency separately")
+        self.write_force(125, 4)
+        self.write_force(225, -9)
+        result = export_recording(
+            self.logs.prefix, self.output, 100, 240,
+            started_wall_ns=1_790_495_000_000_000_000)
+        self.assertEqual(result["counts"]["command"], 3)
+        self.assertEqual(result["events"], 1)
+        self.assertEqual(result["counts"]["latency"], 0)
+        self.assertEqual(result["detected"], 0)
+        with zipfile.ZipFile(result["path"]) as arc:
+            commands = read_zip_csv(arc, "command.csv")
+            self.assertEqual(
+                [int(x["mono_ns"]) for x in commands], [120, 140, 200])
+            self.assertEqual(
+                [int(x["dshot"]) for x in commands], [1100, 0, 50])
+            self.assertEqual(
+                [x["row_type"] for x in read_zip_csv(arc, "timeline.csv")],
+                ["command", "force", "command", "command", "force"])
+            summary = read_zip_csv(arc, "event_summary.csv")
+            self.assertEqual(len(summary), 1)
+            self.assertEqual(summary[0]["onset_status"],
+                             "metadata_unavailable")
+            self.assertEqual(summary[0]["onset_delay_ms"], "")
+            self.assertEqual(summary[0]["command_mono_ns"], "200")
+            meta = json.loads(arc.read("metadata.json"))
+            self.assertEqual(meta["command_source"],
+                             "authoritative_control_csv")
+            self.assertEqual(meta["recovered_control_references"], 1)
+            self.assertTrue(meta["data_integrity_warnings"])
+            self.assertEqual(meta["latency_status"], "not_measured")
+
+    def test_force_only_archive_explicitly_labels_missing_commands(self):
+        self.write_force(200, 12)
+        result = export_recording(
+            self.logs.prefix, self.output, 100, 300,
+            started_wall_ns=1_790_495_000_000_000_000)
+        self.assertEqual(result["counts"]["command"], 0)
+        self.assertEqual(result["metadata"]["command_source"], "none")
+        self.assertTrue(any(
+            "Force-only" in warning for warning in result["warnings"]))
+
+    def test_two_overlapping_motor_controllers_are_ambiguous(self):
+        for i in range(2):
+            ctl = SessionLogs(
+                self.path / "continuous", "raw_count",
+                prefix_tag="control")
+            self.addCleanup(ctl.close)
+            ctl.write(
+                "command", wall_ns=2000, mono_ns=200,
+                mode="SINE", channel=1, dshot=1100,
+                sine=0.5, logical_direction=1, phase_rad=0.5,
+                last_force="", force_unit="raw_count")
+        self.write_force(200, 5)
+        with self.assertRaisesRegex(ExportError, "Multiple Motor Test"):
+            export_recording(
+                self.logs.prefix, self.output, 100, 300,
+                started_wall_ns=1_790_495_000_000_000_000)
+
     def test_no_force_or_missing_folder_never_write_success_archive(self):
         self.write_command(200, 1100, 1)
         with self.assertRaisesRegex(ExportError, "No force samples"):

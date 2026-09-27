@@ -180,3 +180,56 @@ find /home/hby/bidirectional/measurements -maxdepth 1 \
 ```
 
 如果控制 CSV 非零、采集 CSV 始终空白，说明实时显示问题和 ROS 元数据传输问题是两回事。优先检查 root 和普通用户进程的 ROS_DOMAIN_ID/RMW 是否一致、`ros2 topic info -v` 的 publisher/subscriber 计数，以及普通用户是否对 `control_*_command.csv` 具有读取权限。不要仅凭 `SINE` 模式判定某一瞬间的 DSHOT 必定非零：换向等待与正弦死区本来就会输出零。
+
+## 8. DSHOT 时间戳、双进程同步和 ZIP 缺失字段修复
+
+### 数据流和具体修复
+
+Motor Test 的 `control_*_command.csv` 本来就记录了每条 DSHOT 的 **`mono_ns = time.monotonic_ns()`（紧靠 `publisher.publish` 之前）**、`wall_ns`、`mode`、`dshot`、`logical_direction`。它是 **ROS 指令发布时间**，不是 H750/ESC 的实际执行时间。此前 GUI 只打包采集进程的 `g10_*_command.csv`；跨 root/桌面进程的 ROS 元数据未送达时，就会得到「推力正常但 `command.csv`、`event.csv`、`latency.csv` 全空」的 ZIP。这不是 Motor Test 没有时间戳。
+
+现在采用两层恢复：
+
+1. **运行期间**：G10 收到 ROS `/bidirectional_motor_test/command_meta` 后仍采用原消息。每 200 ms 还会只读扫描同一工作空间内持续刷新的 `control_*_command.csv` 和 `control_*_event.csv`；通过真实 `mono_ns` 去重/验证，补偿丢失的消息。补偿不创建 DSHOT 发布者，不控制电机。迟到的换向事件根据历史命令时间戳验证，不再只比较「最新命令」导致丢弃。补偿的数据源写在 `g10_*_command.csv` 的 `metadata_source` 字段（`ros` / `control_csv`）。
+2. **导出时**：按实际 `mono_ns` 覆盖的录制区间查找唯一 `control_*_command.csv`，优先用 Motor Test 原始命令构建 ZIP 的 `command.csv` 和 `timeline.csv`。若有原始换向事件而采集端没收到，则把**真实命令 t0** 写入 `event.csv` / `event_summary.csv`，但标记 `metadata_unavailable`，**绝不杜撰推力延迟**。多个控制会话重叠时直接拒绝猜测来源。
+
+录制开始前 GUI 会提醒是否只有推力而没有 DSHOT；保存时对「指令存在但延迟未测到」给出醒目的警告。在 ZIP 的 `metadata.json` 检查 `command_source`、`controller_session`、`recovered_control_references`、`latency_status` 和 `data_integrity_warnings`。需要注意：`latency.csv` 只有在采集端实际识别到事件时才有结果；未发生换向、未能确认新鲜基线、尚未到检测阈值或实时元数据持续失败，都可能使其**合理地为空**，这与丢失 DSHOT 指令不同。
+
+### 现场验证与故障排查
+
+先使台架断开 ESC 动力，再分别启动 EtherCAT、Motor Test、GUI「启动采集」。**两者须在同一台 Ubuntu 主机**，使用同一单调时间基准，并共享 `/home/hby/bidirectional/measurements`。先查看发布者/订阅者：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/hby/one/install/setup.bash
+source /home/hby/bidirectional/install/setup.bash
+ros2 topic info /bidirectional_motor_test/command_meta -v
+ros2 topic echo /bidirectional_motor_test/command_meta --once
+```
+
+控制节点和 G10 接收节点分别由 `control_...` 和 `g10_...` 命名。下面的命令可以快速查看它们的原始计数；替换为当前最新前缀即可：
+
+```bash
+cd /home/hby/bidirectional/measurements
+ls -lt control_*_command.csv g10_*_command.csv | head -8
+tail -n 3 "$(ls -t control_*_command.csv | head -1)"
+tail -n 3 "$(ls -t g10_*_command.csv | head -1)"
+tail -n 3 "$(ls -t g10_*_g10_quality.csv | head -1)"
+```
+
+`g10_quality.csv` 新增 `metadata_source`、`command_age_ms`、`ros_commands`、`csv_recovered_commands`。如果 ROS 订阅者发现不到发布者，仍要核对 root 与普通用户环境下的 `ROS_DOMAIN_ID` / `RMW_IMPLEMENTATION` / DDS 网络配置；CSV 只读补偿只是降低数据丢失，**不会修复 DDS 本身**。检查文件权限：普通用户必须能读取 root 创建的 `control_*` CSV。若监测不到真实控制指令，录制仍可用于砝码标定，但不能用于指令→推力响应分析。
+
+**针对 2026-09-27 约 ±32 raw_count 的实验**，采集侧起效阈值从 50 counts 调整为 8 counts（仅测量阈值，不改变 DSHOT/正反转安全联锁）。这是实验性起点，应先在空载及固定工况评估误报，单凭一次改参不能断言真实反转延迟。G10 ADC 时间是根据 UDP 到达时间估算的，不是硬件同步时钟；`latency_ms` 是 ROS `publish` → G10 估算样本变化的**观测延迟**，包含传感器、UDP 和调度偏差。
+
+### 重新导出已录的旧 ZIP（不会修改原 ZIP）
+
+若源 G10 会话和 Motor Test 的控制 CSV 都还留在 `measurements`，可以不用重新做实验：
+
+```bash
+cd /home/hby/bidirectional/Bidirectional-Motor-Test
+python3 scripts/reexport_g10_zip.py \
+  /home/hby/bidirectional/recordings/g10_record_20260927_140117_892738_9734.zip \
+  --measurements /home/hby/bidirectional/measurements \
+  --output /home/hby/bidirectional/recordings
+```
+
+新 ZIP 会保留原始 `mono_ns`。如果之前因 ROS 元数据没到达而没有原生换向窗口或推力检测结果，重新导出只能补回真实控制指令和事件参考，不会反向创造 10 kHz 推力起效时间。若原始 `control_*` 文件被删、跨主机录制、或多个控制会话时间重叠，不能可靠地补回指令数据。

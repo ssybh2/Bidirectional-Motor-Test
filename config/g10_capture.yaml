@@ -28,8 +28,12 @@ g10_acquisition:
     g10_calibration_mass_kg: 0.0
     g10_stability_range_counts: 10.0
     g10_calibration_window_sec: 1.0
-    g10_raw_change_threshold: 50.0
-    g10_raw_sign_threshold: 50.0
+    # Measurement-only detection thresholds; previous 50 counts exceeded
+    # the +/-32 count response in the user's 2026-09-27 capture.
+    # 8 counts is a tentative starting point: validate idle noise,
+    # sensor direction and false-positive rate before interpreting latency.
+    g10_raw_change_threshold: 8.0
+    g10_raw_sign_threshold: 8.0
     g10_log_decimation: 40
     g10_channel_log_decimation: 4
     g10_require_healthy: false

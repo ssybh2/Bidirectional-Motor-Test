@@ -20,7 +20,7 @@ class SessionLogs:
         schemas = {
             "command": ("wall_ns", "mono_ns", "mode", "channel", "dshot",
                         "sine", "logical_direction", "phase_rad",
-                        "last_force", "force_unit"),
+                        "last_force", "force_unit", "metadata_source"),
             "force": ("wall_ns", "mono_ns", "raw_force", "forward_positive_force",
                       "force_unit", "last_dshot"),
             "event": ("wall_ns", "mono_ns", "event_id", "kind", "mode",
@@ -33,7 +33,9 @@ class SessionLogs:
                             "invalid_packets", "queue_dropped",
                             "sequence_gap_events", "timestamp_regressions",
                             "queue_backlog", "zero_samples",
-                            "raw_windows_dropped"),
+                            "raw_windows_dropped", "metadata_source",
+                            "command_age_ms", "ros_commands",
+                            "csv_recovered_commands"),
             # One eight-channel ADC snapshot per N G10 UDP packets.
             # Other channels remain raw/unidentified, NOT calibrated units.
             "g10_channels": ("host_write_wall_ns",

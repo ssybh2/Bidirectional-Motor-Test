@@ -85,6 +85,81 @@ def _filtered(prefix, kind, start_ns, stop_ns):
         yield fields, row
 
 
+def _select_controller(prefix, start_ns, stop_ns):
+    """Pick ONE same-host control session by actual overlapping timestamps.
+
+    Never select a controller based only on filename, wall-clock label or
+    mtime; a previous ROS launch may have left stale CSVs in this directory.
+    """
+    choices = []
+    inaccessible = []
+    for command_path in Path(prefix).parent.glob("control_*_command.csv"):
+        try:
+            for _, row in _read_csv(command_path):
+                stamp = _valid_int(row.get("mono_ns"))
+                dshot = _valid_int(row.get("dshot"))
+                if (stamp is not None and start_ns <= stamp <= stop_ns
+                        and dshot is not None and 0 <= dshot <= 2047):
+                    choices.append(str(command_path)[:-len("_command.csv")])
+                    break
+        except ExportError as exc:
+            inaccessible.append(str(exc))
+    if len(choices) > 1:
+        raise ExportError(
+            "Multiple Motor Test command logs overlap this recording; "
+            "cannot choose a safe authoritative controller: " +
+            ", ".join(choices))
+    return (choices[0] if choices else None), inaccessible
+
+
+def _supplement_reference_events(event_csv, source_prefix, start_ns, stop_ns):
+    """Include genuine control-side reversal references when G10 ROS lost them.
+
+    Mark recovered events as lacking live G10 metadata. No fabricated
+    measurement or physical motor response latency is added.
+    """
+    if source_prefix is None:
+        return 0
+    with open(event_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames
+        existing = list(reader)
+    if not fields:
+        return 0
+    known = {
+        _valid_int(row.get("mono_ns"))
+        for row in existing
+        if row.get("kind") == "force_response_reference"
+    }
+    next_id = max(
+        (_valid_int(row.get("event_id")) or 0 for row in existing),
+        default=0)
+    found = 0
+    for _, row in _filtered(source_prefix, "event", start_ns, stop_ns):
+        if row.get("kind") != "force_response_reference":
+            continue
+        stamp = _valid_int(row.get("mono_ns"))
+        if stamp is None or stamp in known:
+            continue
+        next_id += 1
+        found += 1
+        known.add(stamp)
+        # Event from the controller establishes t0, not a valid force
+        # baseline or observed onset on the G10 sensor.
+        row = dict(row)
+        row["event_id"] = str(next_id)
+        row["detail"] = (
+            "NO_COLLECTOR_METADATA: " + row.get("detail", ""))
+        existing.append(row)
+    if found:
+        existing.sort(key=lambda row: _valid_int(row.get("mono_ns")) or 0)
+        with open(event_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(existing)
+    return found
+
+
 def _write_filtered(prefix, kind, start_ns, stop_ns, file_path):
     count = 0
     header = None
@@ -206,11 +281,14 @@ def _event_summary(files, target, start_ns, stop_ns):
         command_ns = int(event["mono_ns"])
         command = commands.get(command_ns, {})
         baseline_missing = "NO_RECENT_FORCE" in event.get("detail", "")
+        metadata_missing = "NO_COLLECTOR_METADATA" in event.get("detail", "")
         metrics = {}
         for name in LATENCY_NAMES:
             row = latency.get((event_id, name))
             status = row.get("status", "") if row else (
-                "no_recent_force" if baseline_missing else "unresolved_at_stop")
+                "metadata_unavailable" if metadata_missing else
+                "no_recent_force" if baseline_missing else
+                "unresolved_at_stop")
             metrics[name] = (
                 status,
                 row.get("observed_mono_ns", "") if row else "",
@@ -232,10 +310,14 @@ def _event_summary(files, target, start_ns, stop_ns):
             "target_sign_status": metrics["target_sign"][0],
             "target_sign_observed_mono_ns": metrics["target_sign"][1],
             "target_sign_delay_ms": metrics["target_sign"][2],
-            "note": ("No fresh G10 force baseline" if baseline_missing
-                     else ("No complete onset measurement within the "
-                           "selected recording" if not
-                           latency.get((event_id, "force_onset")) else "")),
+            "note": (
+                "Control timestamp recovered from separate CSV; "
+                "G10 live metadata missing, latency NOT measured"
+                if metadata_missing else
+                "No fresh G10 force baseline" if baseline_missing
+                else ("No complete onset measurement within the "
+                      "selected recording" if not
+                      latency.get((event_id, "force_onset")) else "")),
         }
         summary.append(item)
     with open(target, "w", encoding="utf-8", newline="") as f:
@@ -294,14 +376,37 @@ def export_recording(prefix, destination, start_ns, stop_ns,
         raise ExportError("Recording file already exists: " + str(output))
 
     counts = {}
+    controller, control_errors = _select_controller(
+        prefix, start_ns, stop_ns)
+    warnings = list(control_errors)
     try:
         with tempfile.TemporaryDirectory(prefix="g10_export_") as temp:
             temp = Path(temp)
             files = {}
             for kind in KINDS:
                 files[kind] = temp / (kind + ".csv")
+                # Control logs are authoritative when accessible and their
+                # monotonic timestamps overlap this exact recording. They
+                # remain distinct from the 10 kHz G10 sampling clock.
+                origin = controller if kind == "command" and controller else prefix
                 counts[kind] = _write_filtered(
-                    prefix, kind, start_ns, stop_ns, files[kind])
+                    origin, kind, start_ns, stop_ns, files[kind])
+            recovered = _supplement_reference_events(
+                files["event"], controller, start_ns, stop_ns)
+            counts["event"] += recovered
+            if recovered:
+                warnings.append(
+                    "%d controller reversal references recovered; G10 did "
+                    "not produce corresponding live onset decisions" % recovered)
+            if not counts["command"]:
+                warnings.append(
+                    "No Motor Test command timestamps in this interval. "
+                    "Force-only recording; DSHOT latency unavailable.")
+            if controller and not counts["latency"]:
+                warnings.append(
+                    "Motor Test timestamps included from its separate CSV, "
+                    "but no verified G10 latency results were recorded. "
+                    "Do not infer motor response time from this ZIP.")
             if not counts["force"]:
                 raise ExportError("No force samples in the selected interval")
             timeline = temp / "timeline.csv"
@@ -340,6 +445,17 @@ def export_recording(prefix, destination, start_ns, stop_ns,
                 "stop_wall_ns": stopped_wall_ns,
                 "duration_s": (stop_ns - start_ns) / 1e9,
                 "row_counts": counts,
+                "command_source": (
+                    "authoritative_control_csv" if controller else
+                    "collector_ros_metadata" if counts["command"] else "none"),
+                "controller_session": (
+                    Path(controller).name if controller else None),
+                "recovered_control_references": recovered,
+                "data_integrity_warnings": warnings,
+                "latency_status": (
+                    "detected" if onset else
+                    "not_measured" if not counts["latency"] else
+                    "no_detected_onset"),
                 "native_rate_event_files": len(raw_event_paths),
                 "native_rate_event_missing_or_not_finished": raw_missing,
                 "force_onset_detected": len(onset),
@@ -396,4 +512,5 @@ def export_recording(prefix, destination, start_ns, stop_ns,
         "onset_mean_ms": (
             sum(onset) / len(onset)) if onset else None,
         "metadata": metadata,
+        "warnings": warnings,
     }

@@ -409,11 +409,19 @@ class Dashboard:
                     # Without this metadata ZIP timing cannot be trusted.
                     metadata_fresh = (
                         control is not None and collector_command_fresh(prefix))
+                    meta_source = quality.get("metadata_source", "")
+                    if metadata_fresh and meta_source == "control_csv":
+                        meta_label = "指令由共享 CSV 补偿"
+                    elif metadata_fresh:
+                        meta_label = "指令元数据在线"
+                    elif control is not None:
+                        meta_label = "指令未同步；导出可回查控制 CSV"
+                    else:
+                        meta_label = "没有可用的指令时间戳"
                     self.age_value.set(
                         "%s · 丢包 %s · %s" %
                         (reason, quality.get("queue_dropped", "?"),
-                         "指令元数据在线" if metadata_fresh else
-                         "指令元数据未同步"))
+                         meta_label))
 
                 if not healthy and self.own_proc is None:
                     self._set_note(
@@ -515,6 +523,21 @@ class Dashboard:
                 "等待自动归零完成，并确认采集状态为「正常」。"
                 "无数据或数据过期时不能开始有效的推力实验录制。")
             return
+        controller = latest_control_command(LOG_DIR)
+        linked = collector_command_fresh(prefix)
+        if controller is None and not linked:
+            if not messagebox.askyesno(
+                    "仅记录推力（无 DSHOT 时间戳）",
+                    "当前 Motor Test 控制日志和 G10 指令元数据均不可用。"
+                    "若继续，只能保存力传感器数据，不能计算"
+                    "「指令到推力」的延迟。\n\n"
+                    "确定只录制推力吗？"):
+                return
+        elif controller is not None and not linked:
+            self._set_note(
+                "控制日志可读，但 ROS 指令元数据暂未同步。"
+                "将以独立控制 CSV 保留发送时间戳；"
+                "若 G10 实时补偿仍失败，延迟不会被伪造。")
         try:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             # Verify that the destination can actually be written now.
@@ -638,10 +661,13 @@ class Dashboard:
         else:
             self.record_latency.set(
                 "没有有效起效延迟（已保留原始记录）")
-        self._set_note("实验录制已保存到：" + result["path"])
+        warnings = result.get("warnings", [])
+        self._set_note(
+            "实验录制已保存到：" + result["path"] +
+            (" · 注意：部分测量缺失，详见 metadata.json"
+             if warnings else ""))
         if not self.closing:
-            messagebox.showinfo(
-                "G10 实验录制完成",
+            summary = (
                 "文件已保存：\n%s\n\nDSHOT：%s 行，推力：%s 行\n"
                 "指令响应事件：%d；成功识别起效延迟：%d\n\n"
                 "仅为 ROS 指令发布时间到估算 G10 采样时间的观测延迟。"
@@ -649,6 +675,13 @@ class Dashboard:
                    result["counts"]["command"],
                    result["counts"]["force"],
                    result["events"], result["detected"]))
+            if warnings:
+                summary += ("\n\n数据完整性警告：\n" +
+                            "\n".join(warnings[:4]))
+                messagebox.showwarning(
+                    "录制已保存，但时间戳/延迟数据不完整", summary)
+            else:
+                messagebox.showinfo("G10 实验录制完成", summary)
         if after_save:
             after_save()
 

@@ -1,12 +1,16 @@
 """Collector cannot control motors, while controller timestamps correlate ADC."""
 from collections import deque
 import json
+import tempfile
+from pathlib import Path
 import time
 import types
 import unittest
 from unittest import mock
 
 from test_motor_node_callbacks import NodeTickTests
+from bidirectional_motor_test.session_logs import SessionLogs
+from bidirectional_motor_test.control_recovery import recent_control_metadata
 
 
 class CaptureSeparationTests(unittest.TestCase):
@@ -31,6 +35,11 @@ class CaptureSeparationTests(unittest.TestCase):
         node.last_command = 0
         node.last_remote_command_ns = None
         node.last_remote_command_rx_ns = None
+        node.command_signatures = {}
+        node.seen_reference_stamps = set()
+        node.metadata_source = "none"
+        node.metadata_ros_commands = 0
+        node.metadata_csv_commands = 0
         node.event_id = 0
         node.force_unit = "raw_count"
         node.raw_capture = None
@@ -80,6 +89,88 @@ class CaptureSeparationTests(unittest.TestCase):
             for row in values), values)
         self.assertEqual([
             row["mono_ns"] for kind, row in node.rows if kind == "command"], [t0])
+
+    def test_reference_arriving_after_newer_command_is_not_discarded(self):
+        node = self.make_capture()
+        t0 = time.monotonic_ns() - 40_000_000
+        node.force_history.extend([
+            (t0 - 1_000_000, 0.0),
+            (t0 + 1_000_000, 12.0),
+            (t0 + 2_000_000, 13.0),
+        ])
+        for stamp, value, direction in (
+                (t0, 1100, 1), (t0 + 20_000_000, 0, 0)):
+            node._on_control_meta(types.SimpleNamespace(data=json.dumps({
+                "type": "command", "mono_ns": stamp,
+                "wall_ns": time.time_ns(), "dshot": value,
+                "mode": "SINE", "channel": 1,
+                "sine": .4 if value else 0,
+                "direction": direction, "phase": .4,
+            })))
+        node._on_control_meta(types.SimpleNamespace(data=json.dumps({
+            "type": "reference", "mono_ns": t0,
+            "mode": "SINE", "dshot": 1100, "sine": .4,
+            "direction": 1, "control_event_id": 7,
+        })))
+        self.assertEqual(len([
+            row for kind, row in node.rows
+            if kind == "event" and row["kind"] ==
+            "force_response_reference"]), 1)
+        self.assertTrue(any(kind == "latency" for kind, _ in node.rows))
+        # ROS/CSV duplicates must not create duplicate events or samples.
+        node._on_control_meta(types.SimpleNamespace(data=json.dumps({
+            "type": "reference", "mono_ns": t0,
+            "mode": "SINE", "dshot": 1100, "sine": .4,
+            "direction": 1, "control_event_id": 7,
+        })))
+        self.assertEqual(len([
+            row for kind, row in node.rows if kind == "event"
+            and row["kind"] == "force_response_reference"]), 1)
+
+    def test_csv_fallback_restores_exact_timestamps_when_ros_is_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ctl = SessionLogs(folder, "raw_count", prefix_tag="control")
+            try:
+                node = self.make_capture()
+                node.logs.prefix = str(Path(folder) / "g10_running")
+                t0 = time.monotonic_ns() - 25_000_000
+                for stamp, value, direction in (
+                        (t0, 1100, 1), (t0 + 20_000_000, 0, 0)):
+                    ctl.write(
+                        "command", wall_ns=time.time_ns(), mono_ns=stamp,
+                        mode="SINE", channel=1, dshot=value,
+                        sine=0.4 if value else 0,
+                        logical_direction=direction, phase_rad=0.4,
+                        last_force="", force_unit="raw_count")
+                ctl.write(
+                    "event", wall_ns=time.time_ns(), mono_ns=t0,
+                    event_id=11, kind="force_response_reference",
+                    mode="SINE", dshot=1100, sine=.4,
+                    detail="EXTERNAL_G10: collector computes latency")
+                node.force_history.extend([
+                    (t0 - 1_000_000, 0.0),
+                    (t0 + 1_000_000, 12.0),
+                    (t0 + 2_000_000, 13.0),
+                ])
+                _, messages = recent_control_metadata(
+                    folder, time.monotonic_ns())
+                self.assertEqual(
+                    [m["type"] for m in messages],
+                    ["command", "reference", "command"])
+                node._recover_control_csv(time.monotonic_ns())
+                self.assertEqual(node.metadata_source, "control_csv")
+                self.assertEqual(node.metadata_csv_commands, 2)
+                self.assertEqual(len([
+                    row for kind, row in node.rows
+                    if kind == "command"]), 2)
+                self.assertEqual(len([
+                    row for kind, row in node.rows
+                    if kind == "event" and row["kind"] ==
+                    "force_response_reference"]), 1)
+                node._recover_control_csv(time.monotonic_ns())
+                self.assertEqual(node.metadata_csv_commands, 2)
+            finally:
+                ctl.close()
 
     def test_disarm_cancels_incomplete_latency_without_motor_publish(self):
         node = self.make_capture()

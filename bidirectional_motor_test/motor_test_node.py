@@ -18,6 +18,7 @@ from std_srvs.srv import Trigger
 from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 
 from .core import SineDshot, SwitchInterlock
+from .control_recovery import recent_control_metadata
 from .g10_udp import G10UDPReceiver
 from .g10_calibration import (
     CalibrationError, StableADCWindow, adc_delta, load_scale, save_scale,
@@ -267,6 +268,12 @@ class BidirectionalMotorTest(Node):
         self.force_history = deque(maxlen=30000)
         self.last_remote_command_rx_ns = None
         self.last_remote_command_ns = None
+        self.command_signatures = {}  # exact t0 -> validated mode, value, direction
+        self.seen_reference_stamps = set()
+        self.last_bridge_poll_ns = 0
+        self.metadata_source = "none"
+        self.metadata_ros_commands = 0
+        self.metadata_csv_commands = 0
         self.last_command = 0
         self.last_mode = None
         self.last_wave_stopped_ns = None
@@ -397,8 +404,25 @@ class BidirectionalMotorTest(Node):
 
     def _capture_tick(self):
         now = time.monotonic_ns()
+        # A root-run controller and desktop-user G10 receiver may have DDS
+        # discovery/QoS issues. Read the controller's already-flushed CSV as
+        # an independent SAME-HOST metadata path, never as a motor input.
+        if (getattr(self, "acquisition_only", False) and
+                now - getattr(self, "last_bridge_poll_ns", 0) >= 200_000_000):
+            self.last_bridge_poll_ns = now
+            self._recover_control_csv(now)
         for result in self.latency.expire(now):
             self._log_result(result)
+
+    def _recover_control_csv(self, now_ns):
+        prefix, rows = recent_control_metadata(
+            __import__("pathlib").Path(self.logs.prefix).parent, now_ns)
+        if prefix is None:
+            return
+        for item in rows:
+            # Go through the SAME validation, timestamp and deduplication
+            # path as ROS metadata, so both transports cannot double count.
+            self._on_control_meta(String(data=json.dumps(item)))
 
     def _on_control_meta(self, msg):
         """Use the same-host controller t0; replay buffered G10 ADC samples."""
@@ -411,19 +435,37 @@ class BidirectionalMotorTest(Node):
             now = time.monotonic_ns()
             # monotonic timestamps from separate hosts are not comparable.
             if stamp <= 0 or stamp > now + 50_000_000 or (
-                    now - stamp > 1_000_000_000):
+                    now - stamp > 2_000_000_000):
                 return
+            source = (
+                "control_csv" if event.get("source") == "control_csv"
+                else "ros")
             if kind == "command":
                 value = int(event["dshot"])
                 mode = str(event["mode"])
                 direction = int(event["direction"])
                 if not 0 <= value <= 2047 or direction not in (-1, 0, 1):
                     return
+                signatures = getattr(self, "command_signatures", None)
+                if signatures is None:
+                    signatures = self.command_signatures = {}
+                if stamp in signatures:
+                    return  # ROS and CSV both carried this command.
+                signatures[stamp] = (mode, value, direction)
+                # Keep a short bounded history for reference events that
+                # arrive AFTER the next command (previously lost entirely).
+                if len(signatures) > 256:
+                    signatures.pop(next(iter(signatures)))
                 if (self.last_remote_command_ns is not None and
                         stamp <= self.last_remote_command_ns):
-                    return
+                    return  # Valid late record: needed for ref, not CSV order.
                 self.last_remote_command_ns = stamp
                 self.last_remote_command_rx_ns = now
+                self.metadata_source = source
+                if source == "ros":
+                    self.metadata_ros_commands += 1
+                else:
+                    self.metadata_csv_commands += 1
                 self.last_command = value
                 self.last_mode = mode
                 # Cancel incomplete response estimates if RC disarms/stops.
@@ -437,15 +479,24 @@ class BidirectionalMotorTest(Node):
                     logical_direction=direction,
                     phase_rad=float(event["phase"]),
                     last_force=self.last_force if self.last_force is not None else "",
-                    force_unit=self.force_unit)
+                    force_unit=self.force_unit, metadata_source=source)
             elif kind == "reference":
-                if (self.last_remote_command_ns != stamp
-                        or self.last_mode != "SINE" or
-                        self.last_command == 0):
-                    return
+                signatures = getattr(self, "command_signatures", {})
+                matching = signatures.get(stamp)
                 direction = int(event["direction"])
-                if direction not in (-1, 1):
+                if (matching is None or matching != (
+                        "SINE", int(event["dshot"]), direction)
+                        or direction not in (-1, 1)):
                     return
+                seen = getattr(self, "seen_reference_stamps", None)
+                if seen is None:
+                    seen = self.seen_reference_stamps = set()
+                if stamp in seen:
+                    return
+                seen.add(stamp)
+                if len(seen) > 1024:
+                    seen.clear()
+                    seen.add(stamp)
                 self.event_id += 1
                 eid = self.event_id
                 if self.raw_capture is not None and not (
@@ -593,6 +644,12 @@ class BidirectionalMotorTest(Node):
             sequence_gap_events=self.g10_sequence_gaps,
             timestamp_regressions=self.g10_timestamp_regressions,
             queue_backlog=self.g10.packets.qsize(),
+            metadata_source=self.metadata_source,
+            command_age_ms=(
+                (now - self.last_remote_command_rx_ns) / 1e6
+                if self.last_remote_command_rx_ns is not None else ""),
+            ros_commands=self.metadata_ros_commands,
+            csv_recovered_commands=self.metadata_csv_commands,
             zero_samples=self.g10_zero_count,
             raw_windows_dropped=(
                 self.raw_capture.dropped_windows if self.raw_capture else 0))
