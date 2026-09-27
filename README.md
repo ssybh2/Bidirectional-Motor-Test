@@ -20,7 +20,10 @@ ip -br -4 addr show enp5s0
 ```
 
 已验证的 G10 数据流为 `192.168.127.56:5000 → 192.168.127.55:4800/UDP`。配置不应覆盖 EtherCAT 网口，也无需更改系统默认网关。以上 IP 配置为临时配置，重启后可能需要重新设置。
-
+```bash
+sudo ip link set enp5s0 up
+sudo ip addr replace 192.168.127.55/24 dev enp5s0
+```
 ## 2. 安装 ROS 包与桌面软件
 
 前置条件：Ubuntu 22.04 已安装 **ROS 2 Humble**；可正常编译 `colcon` 工作空间；已具备项目使用的 `custom_msgs`（来自 [EcatV2_Master](https://github.com/AIMEtherCAT/EcatV2_Master)，可在同一个工作空间编译，或 source 已安装它的工作空间）。仅有本仓库、缺少 `custom_msgs` 时，ROS 节点无法编译。
