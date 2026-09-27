@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import deque
 import math
 import os
+import tempfile
 from pathlib import Path
 import re
 import signal
@@ -18,7 +19,7 @@ import time
 
 try:
     import tkinter as tk
-    from tkinter import messagebox
+    from tkinter import filedialog, messagebox
     from tkinter import font as tkfont
 except ImportError as exc:
     raise SystemExit(
@@ -29,6 +30,7 @@ from .gui_data import (
     last_row, latest_session, parse_channels, parse_force, plot_limits,
     recent_rows, stream_fresh,
 )
+from .session_export import export_recording, ExportError
 
 
 ROOT = "#101827"
@@ -76,6 +78,15 @@ class Dashboard:
         self.ros_job_busy = False
         self.closing = False
         self.stop_requested = False
+        self.recording = None
+        self.record_saving = False
+        self.record_dir = Path(os.environ.get(
+            "G10_EXPORT_DIR", "~/bidirectional/recordings")).expanduser()
+        self.record_status = tk.StringVar(value="● 未录制")
+        self.record_folder_text = tk.StringVar(
+            value=str(self.record_dir))
+        self.record_latency = tk.StringVar(
+            value="延迟：等待录制")
         self.status_note = tk.StringVar(value="准备就绪 · 尚未连接采集")
         self.network_note = tk.StringVar(value="等待采集")
         self.mass_var = tk.StringVar(value="")
@@ -126,14 +137,30 @@ class Dashboard:
                              highlightbackground=EDGE, highlightthickness=1)
             frame.grid(row=0, column=col, sticky="ew", padx=5)
             self._txt(frame, label, 10, MUTED).pack(anchor="w")
-            self._txt(frame, "", 24, CYAN if col == 0 else INK,
-                      bold=True, textvariable=var).pack(
-                anchor="w", pady=(8, 3))
-            if isinstance(detail, tk.StringVar):
-                self._txt(frame, "", 10, MUTED, textvariable=detail).pack(
-                    anchor="w")
+            if col == 0:
+                # Put the *actual* force unit next to the value, not only
+                # in a separate small line the user may overlook.
+                number_row = tk.Frame(frame, bg=SURFACE)
+                number_row.pack(anchor="w", pady=(8, 3))
+                self._txt(
+                    number_row, "", 24, CYAN, bold=True,
+                    textvariable=var).pack(side="left")
+                self._txt(
+                    number_row, "", 12, MUTED,
+                    textvariable=self.unit_value).pack(
+                    side="left", padx=(9, 0), pady=(7, 0))
+                self._txt(
+                    frame, "raw_count 未标定；kgf 为砝码标定后单位",
+                    9, MUTED).pack(anchor="w")
             else:
-                self._txt(frame, detail, 10, MUTED).pack(anchor="w")
+                self._txt(frame, "", 24, INK,
+                          bold=True, textvariable=var).pack(
+                    anchor="w", pady=(8, 3))
+                if isinstance(detail, tk.StringVar):
+                    self._txt(frame, "", 10, MUTED,
+                              textvariable=detail).pack(anchor="w")
+                else:
+                    self._txt(frame, detail, 10, MUTED).pack(anchor="w")
 
         work = tk.Frame(self.root, bg=ROOT, padx=24, pady=18)
         work.pack(fill="both", expand=True)
@@ -215,9 +242,39 @@ class Dashboard:
         self.mass.pack(side="left", ipady=7)
         self.btn_calibrate = self._button(
             first, "砝码标定", self._calibrate, CYAN)
+        record_bar = tk.Frame(controls, bg=SURFACE)
+        record_bar.pack(fill="x", pady=(12, 1))
+        self._txt(record_bar, "实验录制", 13, bold=True).pack(
+            side="left", padx=(0, 12))
+        self.btn_record_start = self._button(
+            record_bar, "● 开始录制", self._record_start, GREEN)
+        self.btn_record_stop = self._button(
+            record_bar, "■ 结束并保存", self._record_stop, AMBER)
+        self.btn_record_stop.config(state="disabled")
+        self.btn_record_folder = self._button(
+            record_bar, "选择保存目录…", self._choose_record_dir, CYAN)
+        self._txt(
+            record_bar, "", 10, MUTED,
+            textvariable=self.record_status).pack(
+                side="left", padx=(12, 7))
+        self._txt(
+            record_bar, "", 10, CYAN,
+            textvariable=self.record_latency).pack(side="right")
+
+        folder_bar = tk.Frame(controls, bg=SURFACE)
+        folder_bar.pack(fill="x", pady=(5, 1))
+        self._txt(folder_bar, "保存到：", 10, MUTED).pack(side="left")
+        self._txt(folder_bar, "", 10, MUTED,
+                  textvariable=self.record_folder_text,
+                  anchor="w").pack(side="left", fill="x", expand=True)
         self._txt(
             controls,
-            "GUI 仅显示/标定测量数据，不代替遥控器停机和独立硬件急停。"
+            "录制文件为一个 ZIP，内含原始 DSHOT/推力 CSV、"
+            "时间轴、每次换向的延迟及测量说明；界面刷新不参与计时。",
+            10, MUTED, justify="left").pack(anchor="w", pady=(4, 0))
+        self._txt(
+            controls,
+            "GUI 仅显示/标定测量数据，不代替遥控器停机和独立硬件急停."
             " 去皮与标定要求 DSHOT=0、遥控器 DISARM、静态载荷。",
             10, MUTED, wraplength=1180, justify="left"
         ).pack(anchor="w", pady=(9, 0))
@@ -321,6 +378,7 @@ class Dashboard:
                         (code, self.own_log))
             elif self.own_proc is None:
                 self.btn_stop.config(state="disabled")
+            self._refresh_recording()
             self._draw()
         except Exception as exc:
             self._set_note("界面刷新异常（采集不受影响）：" + str(exc))
@@ -375,6 +433,177 @@ class Dashboard:
                           fill=MUTED, font=(FONT, 13))
         c.create_text(x0, 8, text=self.last_unit or "raw_count",
                       fill=MUTED, anchor="w", font=(FONT, 9))
+
+    def _choose_record_dir(self):
+        if self.recording is not None or self.record_saving:
+            self._set_note("请先结束当前录制，再更改保存目录。")
+            return
+        initial = self.record_dir if self.record_dir.is_dir() else Path.home()
+        selected = filedialog.askdirectory(
+            title="选择 G10 实验记录保存目录",
+            initialdir=str(initial), mustexist=True)
+        if selected:
+            self.record_dir = Path(selected).expanduser()
+            self.record_folder_text.set(str(self.record_dir))
+            self._set_note("录制完成后将保存一个 ZIP 至所选目录。")
+
+    def _record_start(self):
+        """Mark recording on the SAME host monotonic clock as ROS/G10."""
+        if self.record_saving or self.recording is not None:
+            self._set_note("已有录制正在进行或正在保存。")
+            return
+        prefix = latest_session(LOG_DIR)
+        if prefix is None or not stream_fresh(prefix, max_age_sec=2.0):
+            messagebox.showwarning(
+                "无法开始录制",
+                "请先点击「启动采集」，并等待 G10 实时数据在线。")
+            return
+        quality = last_row(prefix, "g10_quality")
+        if quality is None or quality.get("stream_ready") != "1":
+            messagebox.showwarning(
+                "G10 数据尚未就绪",
+                "等待自动归零完成，并确认采集状态为「正常」。"
+                "无数据或数据过期时不能开始有效的推力实验录制。")
+            return
+        try:
+            self.record_dir.mkdir(parents=True, exist_ok=True)
+            # Verify that the destination can actually be written now.
+            with tempfile.TemporaryFile(dir=self.record_dir):
+                pass
+        except OSError as exc:
+            messagebox.showerror(
+                "保存目录不可写",
+                "请重新选择一个有写入权限的目录。\n%s" % exc)
+            return
+        started_ns = time.monotonic_ns()
+        self.recording = {
+            "prefix": prefix,
+            "folder": str(self.record_dir),
+            "start_ns": started_ns,
+            "start_wall_ns": time.time_ns(),
+            "stop_ns": None,
+            "stop_wall_ns": None,
+        }
+        self.record_status.set("● 正在录制 00:00")
+        self.record_latency.set("延迟：等待第一次有效指令变化")
+        self.btn_record_start.config(state="disabled")
+        self.btn_record_stop.config(state="normal")
+        self.btn_record_folder.config(state="disabled")
+        self._set_note(
+            "录制开始：DSHOT 指令与 G10 推力沿用同一 Ubuntu 单调时间基准。"
+            "请通过遥控器按原安全流程进行测试。")
+
+    def _refresh_recording(self):
+        session = self.recording
+        if session is None or session["stop_ns"] is not None:
+            return
+        elapsed = max(
+            0, (time.monotonic_ns() - session["start_ns"]) // 1_000_000_000)
+        self.record_status.set(
+            "● 正在录制 %02d:%02d" % (elapsed // 60, elapsed % 60))
+        # Show only authoritative, detector-produced results for this
+        # recording. Never estimate onset from the 4 Hz screen refresh.
+        latency_path = session["prefix"] + "_latency.csv"
+        for row in reversed(recent_rows(latency_path, 16384)):
+            try:
+                within = (int(row["command_mono_ns"]) >=
+                          session["start_ns"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            if (within and row.get("metric") == "force_onset" and
+                    row.get("status") == "detected" and
+                    row.get("latency_ms")):
+                self.record_latency.set(
+                    "最近推力起效：%s ms（观测值）" %
+                    row["latency_ms"])
+                break
+
+    def _record_stop(self):
+        if self.recording is None:
+            self._set_note("当前没有正在录制的实验。")
+            return
+        self._finish_recording()
+
+    def _finish_recording(self, after_save=None):
+        """Export a bounded archive off the GUI thread, without halting ROS."""
+        if self.recording is None:
+            if after_save:
+                after_save()
+            return
+        if self.record_saving:
+            self._set_note("实验数据正在保存，请等待完成。")
+            return
+        session = self.recording
+        if session["stop_ns"] is None:
+            session["stop_ns"] = time.monotonic_ns()
+            session["stop_wall_ns"] = time.time_ns()
+        self.record_saving = True
+        self.btn_record_stop.config(state="disabled")
+        self.btn_record_start.config(state="disabled")
+        self.btn_record_folder.config(state="disabled")
+        self.record_status.set("● 正在写入 ZIP，请稍候…")
+        self._set_note("正从 ROS 原始 CSV 导出：不是从屏幕曲线重新采样。")
+
+        def worker():
+            try:
+                result = export_recording(
+                    session["prefix"], session["folder"],
+                    session["start_ns"], session["stop_ns"],
+                    session["start_wall_ns"], session["stop_wall_ns"])
+            except Exception as exc:
+                error = str(exc)
+                self.root.after(
+                    0, lambda error=error: self._record_export_failed(error))
+            else:
+                self.root.after(
+                    0, lambda result=result: self._record_exported(
+                        result, after_save))
+
+        threading.Thread(
+            target=worker, daemon=True, name="g10_record_export").start()
+
+    def _record_export_failed(self, message):
+        self.record_saving = False
+        self.closing = False
+        self.btn_record_stop.config(state="normal")
+        self.btn_record_start.config(state="disabled")
+        self.btn_record_folder.config(state="disabled")
+        self.record_status.set("● 保存失败 · 可重试")
+        self._set_note(
+            "导出失败，录制区间已保留；源 CSV 未删除。"
+            "检查保存目录后点击「结束并保存」重试。")
+        messagebox.showerror(
+            "G10 录制保存失败",
+            message + "\n\nROS 原始数据仍保存在 ~/bidirectional/measurements，"
+            "可以修复目录权限后重试。")
+
+    def _record_exported(self, result, after_save=None):
+        self.record_saving = False
+        self.recording = None
+        self.btn_record_start.config(state="normal")
+        self.btn_record_stop.config(state="disabled")
+        self.btn_record_folder.config(state="normal")
+        self.record_status.set("✓ 已保存：%s" % Path(result["path"]).name)
+        if result["onset_mean_ms"] is not None:
+            self.record_latency.set(
+                "已测 %d 次，起效延迟均值 %.3f ms（观测值）" %
+                (result["detected"], result["onset_mean_ms"]))
+        else:
+            self.record_latency.set(
+                "没有有效起效延迟（已保留原始记录）")
+        self._set_note("实验录制已保存到：" + result["path"])
+        if not self.closing:
+            messagebox.showinfo(
+                "G10 实验录制完成",
+                "文件已保存：\n%s\n\nDSHOT：%s 行，推力：%s 行\n"
+                "指令响应事件：%d；成功识别起效延迟：%d\n\n"
+                "仅为 ROS 指令发布时间到估算 G10 采样时间的观测延迟。"
+                % (result["path"],
+                   result["counts"]["command"],
+                   result["counts"]["force"],
+                   result["events"], result["detected"]))
+        if after_save:
+            after_save()
 
     def _start_owned(self):
         if self.own_proc is not None and self.own_proc.poll() is None:
@@ -443,6 +672,11 @@ class Dashboard:
                 "现在请求退出 GUI 启动的 ROS 节点吗？"
                 "此操作不是物理急停。"):
             return
+        # Seal the recording interval *before* shutdown's extra zero-DSHOT
+        # publishes, so the export records exactly what the user requested.
+        if self.recording is not None and self.recording["stop_ns"] is None:
+            self.recording["stop_ns"] = time.monotonic_ns()
+            self.recording["stop_wall_ns"] = time.time_ns()
         try:
             os.killpg(self.own_proc.pid, signal.SIGINT)
             self._set_note(
@@ -452,6 +686,9 @@ class Dashboard:
         except OSError as exc:
             self._set_note("停止请求失败：" + str(exc))
         self.btn_stop.config(state="disabled")
+        if self.recording is not None and not self.record_saving:
+            # Do not block the safety-related ROS shutdown on ZIP writing.
+            self._finish_recording()
 
     def _run_cli(self, args, callback, timeout=12):
         """Run ROS service/parameter CLI off the Tk event loop."""
@@ -536,26 +773,57 @@ class Dashboard:
             after_parameter)
 
     def _on_close(self):
-        if self.own_proc is None or self.own_proc.poll() is not None:
+        if self.record_saving:
+            messagebox.showinfo(
+                "正在保存", "请稍等 ZIP 写入完成，再关闭界面。")
+            return
+        owns_running = (
+            self.own_proc is not None and
+            self.own_proc.poll() is None)
+        if not owns_running and self.recording is None:
             self.closing = True
             self.root.destroy()
             return
-        if not messagebox.askyesno(
-                "关闭 G10 界面",
+        if owns_running:
+            question = (
                 "GUI 启动的 ROS 节点还在运行。\n"
                 "请先 DISARM 并切断 ESC 动力。\n\n"
-                "退出界面前请求停止该节点吗？"):
+                "确认请求停止 ROS、保存录制并关闭界面？"
+                if self.recording is not None else
+                "GUI 启动的 ROS 节点还在运行。\n"
+                "请先 DISARM 并切断 ESC 动力。\n\n"
+                "退出界面前请求停止该节点吗？")
+        else:
+            question = (
+                "当前录制尚未保存。\n"
+                "确认结束录制并保存 ZIP，然后关闭界面？\n"
+                "其他终端启动的 ROS 节点会继续运行。")
+        if not messagebox.askyesno("关闭 G10 界面", question):
             return
         self.closing = True
-        try:
-            os.killpg(self.own_proc.pid, signal.SIGINT)
-        except ProcessLookupError:
-            pass
-        except OSError as exc:
-            self.closing = False
-            messagebox.showerror("退出失败", str(exc))
-            return
-        self._finish_close(time.monotonic() + 8.0)
+        if self.recording is not None and self.recording["stop_ns"] is None:
+            self.recording["stop_ns"] = time.monotonic_ns()
+            self.recording["stop_wall_ns"] = time.time_ns()
+        if owns_running:
+            try:
+                os.killpg(self.own_proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                self.closing = False
+                messagebox.showerror("退出失败", str(exc))
+                return
+        if self.recording is not None:
+            if owns_running:
+                self._finish_recording(
+                    after_save=lambda: self._finish_close(
+                        time.monotonic() + 30.0))
+            else:
+                self._finish_recording(after_save=self.root.destroy)
+        elif owns_running:
+            self._finish_close(time.monotonic() + 30.0)
+        else:
+            self.root.destroy()
 
     def _finish_close(self, deadline):
         if self.own_proc is None or self.own_proc.poll() is not None:
