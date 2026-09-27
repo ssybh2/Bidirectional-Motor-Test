@@ -71,6 +71,7 @@ class Dashboard:
         root.geometry("1300x840")
         root.minsize(1010, 740)
         self.prefix = None
+        self._last_stopped_prefix = None
         self.last_mono = -1
         self.last_unit = None
         self.history = deque(maxlen=580)
@@ -639,11 +640,11 @@ class Dashboard:
         if self.own_proc is not None and self.own_proc.poll() is None:
             self._set_note("该 GUI 已启动采集，不需要再次启动。")
             return
-        # Check the shared directory NOW rather than depending on a previous
-        # 250 ms GUI refresh. The command CSV acts as a heartbeat even when
-        # force.csv is silent during auto-zero or a G10 link failure.
+        # A recently stopped G10 CSV may look fresh for up to 3 seconds.
+        # Never reattach to the collector this GUI just requested to stop.
         active = latest_session(LOG_DIR)
-        if active is not None and acquisition_fresh(active):
+        if (active is not None and active != self._last_stopped_prefix
+                and acquisition_fresh(active)):
             self.prefix = active
             self._set_note(
                 "已附着现有 G10 采集进程；Motor Test 独立运行。"
@@ -717,6 +718,7 @@ class Dashboard:
             self.recording["stop_wall_ns"] = time.time_ns()
         try:
             os.killpg(self.own_proc.pid, signal.SIGINT)
+            self._last_stopped_prefix = self.prefix or latest_session(LOG_DIR)
             self._set_note(
                 "已请求 G10 采集进程退出，Motor Test 不受影响。")
         except ProcessLookupError:
