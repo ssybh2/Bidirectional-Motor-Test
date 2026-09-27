@@ -257,10 +257,44 @@ class NodeTickTests(unittest.TestCase):
             close=lambda: order.append("raw_close"))
         node.logs = types.SimpleNamespace(close=lambda: order.append("csv_close"))
         node._publish = lambda val, *args: order.append("zero")
-        with mock.patch.object(self.module.time, "sleep", lambda _: None):
+        with mock.patch.object(self.module.time, "sleep", lambda _: None), \
+                mock.patch.object(self.module.rclpy, "ok",
+                                  return_value=True, create=True):
             node.shutdown()
         self.assertEqual(order[:10], ["zero"] * 10)
         self.assertEqual(order[10:], ["udp_stop", "raw_close", "csv_close"])
+
+    def test_shutdown_cleans_up_if_context_already_invalid(self):
+        node = self.make_node()
+        order = []
+        node.g10 = types.SimpleNamespace(stop=lambda: order.append("udp_stop"))
+        node.raw_capture = types.SimpleNamespace(
+            close=lambda: order.append("raw_close"))
+        node.logs = types.SimpleNamespace(close=lambda: order.append("csv_close"))
+        node._publish = lambda *a: order.append("publish")
+        with mock.patch.object(self.module.rclpy, "ok",
+                               return_value=False, create=True):
+            node.shutdown()
+        self.assertEqual(order, ["udp_stop", "raw_close", "csv_close"])
+
+    def test_shutdown_handles_publish_failure_without_leaking_udp(self):
+        node = self.make_node()
+        order = []
+        node.g10 = types.SimpleNamespace(stop=lambda: order.append("udp_stop"))
+        node.raw_capture = types.SimpleNamespace(
+            close=lambda: order.append("raw_close"))
+        node.logs = types.SimpleNamespace(close=lambda: order.append("csv_close"))
+
+        def fail_publish(*args):
+            order.append("publish")
+            raise RuntimeError("publisher context invalid")
+
+        node._publish = fail_publish
+        with mock.patch.object(self.module.rclpy, "ok",
+                               return_value=True, create=True):
+            node.shutdown()
+        self.assertEqual(
+            order, ["publish", "udp_stop", "raw_close", "csv_close"])
 
     def test_health_disables_output_for_stale_force_or_disk_failure(self):
         node = self.make_node()

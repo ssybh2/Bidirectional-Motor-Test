@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from bidirectional_motor_test.gui_data import (
-    last_row, latest_session, parse_channels, parse_force,
+    acquisition_fresh, last_row, latest_session, parse_channels, parse_force,
     plot_limits, recent_rows, stream_fresh,
 )
 
@@ -28,6 +28,18 @@ class DesktopDataTests(unittest.TestCase):
             self.assertEqual(latest_session(d), str(two)[:-10])
             self.assertFalse(stream_fresh(str(two)[:-10]))
             self.assertTrue(stream_fresh(str(two)[:-10], now=2.0))
+
+    def test_command_heartbeat_attaches_even_when_g10_is_offline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            prefix = str(Path(folder) / "test_live")
+            Path(prefix + "_force.csv").write_text(
+                "mono_ns,raw_force,forward_positive_force,force_unit,last_dshot\n")
+            command = Path(prefix + "_command.csv")
+            command.write_text("mono_ns,dshot\n100,0\n")
+            os.utime(command, ns=(2 * 10**9, 2 * 10**9))
+            self.assertTrue(acquisition_fresh(prefix, now=2.0))
+            self.assertFalse(stream_fresh(prefix, now=2.0))
+            self.assertFalse(acquisition_fresh(prefix, now=10.0))
 
     def test_tail_rejects_partial_rows_and_missing_files(self):
         with tempfile.TemporaryDirectory() as folder:

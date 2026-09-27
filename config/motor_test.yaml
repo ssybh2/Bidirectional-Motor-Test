@@ -63,6 +63,8 @@ bidirectional_motor_test:
     # Runtime services: /bidirectional_motor_test/g10_tare and g10_calibrate.
     # Save only gain to disk; each startup still needs a fresh zero.
     g10_load_calibration: true
+    # ros2 launch overrides this with <colcon_workspace>/calibration/... .
+    # Direct ros2 run still uses this HOME-relative fallback.
     g10_calibration_file: "~/bidirectional/calibration/g10_channel6.json"
     g10_calibration_mass_kg: 0.0   # set dynamically BEFORE g10_calibrate
     g10_stability_range_counts: 10.0
@@ -89,4 +91,6 @@ bidirectional_motor_test:
     g10_raw_post_sec: 0.75
 
 
+    # ros2 launch resolves this from the installed colcon workspace, never
+    # from root's HOME. For direct ros2 run, override this parameter yourself.
     log_directory: "~/bidirectional/measurements"

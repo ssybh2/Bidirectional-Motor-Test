@@ -28,8 +28,8 @@ except ImportError as exc:
     ) from exc
 
 from .gui_data import (
-    last_row, latest_session, parse_channels, parse_force, plot_limits,
-    recent_rows, stream_fresh,
+    acquisition_fresh, last_row, latest_session, parse_channels, parse_force,
+    plot_limits, recent_rows, stream_fresh,
 )
 from .session_export import export_recording, ExportError
 
@@ -639,10 +639,15 @@ class Dashboard:
         if self.own_proc is not None and self.own_proc.poll() is None:
             self._set_note("该 GUI 已启动采集，不需要再次启动。")
             return
-        if self.prefix and stream_fresh(self.prefix):
+        # Check the shared directory NOW rather than depending on a previous
+        # 250 ms GUI refresh. The command CSV acts as a heartbeat even when
+        # force.csv is silent during auto-zero or a G10 link failure.
+        active = latest_session(LOG_DIR)
+        if active is not None and acquisition_fresh(active):
+            self.prefix = active
             self._set_note(
-                "已有正在运行的 ROS 采集节点，GUI 已自动附着；"
-                "不会再次绑定 UDP 4800。")
+                "已附着现有 ROS 控制/采集节点；"
+                "不会重复启动进程或绑定 UDP 4800。")
             return
         # A stale CSV is not proof the UDP port is free. Protect other apps.
         try:
@@ -654,8 +659,11 @@ class Dashboard:
         except OSError as exc:
             messagebox.showerror(
                 "UDP 端口已占用",
-                "UDP 4800 已被其他进程占用，请先退出 g10_probe 或检查"
-                "正在运行的 ROS 节点。\n" + str(exc))
+                "UDP 4800 已被占用，但没有在共享目录发现新鲜的控制日志。\n"
+                "如果 ROS 节点已运行，请检查它的 CSV= 路径与 GUI 目录一致：\n"
+                "%s\n请勿启动第二个采集进程。可使用 "
+                "sudo ss -lunp | grep ':4800' 检查进程。\n%s"
+                % (LOG_DIR, exc))
             return
         try:
             test = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

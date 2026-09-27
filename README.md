@@ -76,3 +76,41 @@ python3 -m bidirectional_motor_test.g10_probe \
 如提示 `Permission denied` 无法编译，请检查以前是否用 root 生成了 `build/`、`install/`、`log/`；**不要用 sudo 执行 colcon 或启动 GUI**。
 
 更多协议说明、静态标定、换向状态机与日志字段见 [详细技术文档](docs/DETAILED_GUIDE.md)。
+
+## 5. root EtherCAT + 普通用户 G10 GUI（UDP 4800 冲突修复）
+
+**一个 G10 测试台只能有一个 UDP 4800 采集者。** 本 GUI 只读取 CSV，绝不另外抢占 UDP。现在 `ros2 launch bidirectional_motor_test motor_test.launch.py` 会从 **bidirectional_motor_test 的 colcon 安装前缀**计算工作空间，因此 root 与普通用户运行时均使用：
+
+- `<工作空间>/measurements/`（CSV 与实时 GUI）
+- `<工作空间>/calibration/g10_channel6.json`（标定增益）
+
+此规则会覆盖 YAML 中的 `~/...` 直接运行回退值；不依赖 root 的 `HOME`。如果工作空间为 `/home/hby/bidirectional`，启动日志应出现 `CSV=/home/hby/bidirectional/measurements/...`，而不是 `/root/bidirectional/measurements/...`。旧 root 目录中的历史记录不会自动迁移。
+
+**推荐启动顺序（先断开 ESC 动力、拆桨检查）：**
+
+```bash
+# 终端 1：需要原始网卡权限的 EtherCAT 主站按既有方式启动
+sudo -s
+source /opt/ros/humble/setup.bash
+source /home/hby/one/install/setup.bash
+ros2 launch soem_bringup bringup.launch.py
+
+# 终端 2：普通 hby 用户，先确认能收到 RC/DSHOT 话题
+source /opt/ros/humble/setup.bash
+source /home/hby/one/install/setup.bash
+source /home/hby/bidirectional/install/setup.bash
+ros2 topic echo /ecat/sn2555957/app1/read --once
+ros2 launch bidirectional_motor_test motor_test.launch.py
+
+# 终端 3：普通 hby 用户打开 GUI，不要再启第二个采集节点
+bash /home/hby/bidirectional/Bidirectional-Motor-Test/scripts/launch_g10_desktop.sh
+```
+
+如果 Motor Test 确实必须以 root 运行，先确保 `/home/hby/bidirectional/measurements` 及 CSV **对 hby 可读**，标定目录也有合适的共享写权限。历史上由 root 建立的目录可能无法让普通用户创建新会话，务必停机后检查所有权；不要以 root 启动图形界面。正常情况下 DDS 消息订阅/发布本身不需要 root，两端仍须使用同一 ROS_DOMAIN_ID 与兼容的 RMW 环境。
+
+GUI 在点击「启动采集」时，会立即扫描共享目录的 **command.csv 心跳**，即使 G10 正在归零或暂时无力数据，也会附着现有节点而不再次启动。若 UDP 已占用且找不到可读心跳，会明确提示检查 `CSV=` 路径与 `sudo ss -lunp | grep ':4800'`，不会尝试抢占端口。采集进程必须唯一：不要同时运行 g10_probe 或另一套绑定 4800 的厂商软件。
+
+`ros2 run` **绕过了上述 launch 参数覆盖**；若直接运行，请显式指定绝对路径 `log_directory` 和 `g10_calibration_file`，避免再次遇到 root/普通用户 HOME 不一致。
+
+Ctrl+C 后 ROS 2 可能先销毁 DDS 上下文，使最后的 DSHOT 0 **无法发出**。现在退出时会检测上下文、捕获发布异常并继续释放 UDP 与 CSV，但这只解决退出异常，**不构成物理急停，也不保证电机已停转**。请使用独立物理 ESC 动力切断及下位机失联清零措施。
+

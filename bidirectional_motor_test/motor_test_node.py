@@ -779,20 +779,38 @@ class BidirectionalMotorTest(Node):
                     self._log_result(result)
 
     def shutdown(self):
-        # SAFETY: attempt zero commands BEFORE waiting for UDP/CSV I/O.
-        # Closing a raw CSV writer can block for many seconds; it must never
-        # precede best-effort ESC stopping.
+        # SAFETY: zero commands come before potentially slow disk/UDP cleanup.
+        # ros2 launch may already have invalidated the ROS context on SIGINT.
+        # Do NOT assume these best-effort publishes are a hardware stop.
         self.wave.stop()
         try:
-            for _ in range(10):
-                self._publish(0, "SHUTDOWN", 0.0, 0, 0.0)
-                time.sleep(0.01)
+            if not rclpy.ok():
+                self.get_logger().warn(
+                    "ROS context is already invalid; cannot publish shutdown "
+                    "DSHOT 0. Use the independent physical ESC stop.")
+            else:
+                for _ in range(10):
+                    if not rclpy.ok():
+                        break
+                    try:
+                        self._publish(0, "SHUTDOWN", 0.0, 0, 0.0)
+                    except Exception as exc:
+                        self.get_logger().warn(
+                            "Shutdown zero publish failed (%s); physical ESC "
+                            "stop is required." % exc)
+                        break
+                    time.sleep(0.01)
         finally:
-            if self.g10 is not None:
-                self.g10.stop()
-            if self.raw_capture is not None:
-                self.raw_capture.close()
-            self.logs.close()
+            # Each cleanup must run even when a previous one fails.
+            try:
+                if self.g10 is not None:
+                    self.g10.stop()
+            finally:
+                try:
+                    if self.raw_capture is not None:
+                        self.raw_capture.close()
+                finally:
+                    self.logs.close()
 
 
 def main(args=None):
@@ -804,11 +822,15 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        if node is not None:
-            node.shutdown()
-            node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            if node is not None:
+                try:
+                    node.shutdown()
+                finally:
+                    node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == "__main__":

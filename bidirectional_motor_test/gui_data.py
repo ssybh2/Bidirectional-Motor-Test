@@ -78,13 +78,29 @@ def last_row(prefix, record_type):
     return rows[-1] if rows else None
 
 
-def stream_fresh(prefix, max_age_sec=3.0, now=None):
+def _file_fresh(path, max_age_sec, now):
     now = time.time() if now is None else now
     try:
-        mtime = Path(str(prefix) + FORCE_SUFFIX).stat().st_mtime
+        mtime = Path(path).stat().st_mtime
     except OSError:
         return False
     return -1.0 <= now - mtime <= max_age_sec
+
+
+def stream_fresh(prefix, max_age_sec=3.0, now=None):
+    """Whether actual G10 force samples are fresh, not just ROS commands."""
+    return _file_fresh(
+        str(prefix) + FORCE_SUFFIX, max_age_sec, now)
+
+
+def acquisition_fresh(prefix, max_age_sec=3.0, now=None):
+    """Whether the node is publishing commands, even before G10 auto-zero.
+
+    A live control node can publish DSHOT 0 while force.csv has only a
+    header (or G10 is offline). Avoid starting another UDP listener then.
+    """
+    return _file_fresh(
+        str(prefix) + "_command.csv", max_age_sec, now)
 
 
 def parse_force(row):
