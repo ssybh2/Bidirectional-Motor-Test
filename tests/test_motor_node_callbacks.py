@@ -87,6 +87,19 @@ class NodeTickTests(unittest.TestCase):
         self.assertEqual(node.latency.pending["baseline"], 0.0)
         self.assertEqual(node.published, [1100])
 
+    def test_shutdown_sends_zero_before_any_slow_csv_close(self):
+        node = self.make_node()
+        order = []
+        node.g10 = types.SimpleNamespace(stop=lambda: order.append("udp_stop"))
+        node.raw_capture = types.SimpleNamespace(
+            close=lambda: order.append("raw_close"))
+        node.logs = types.SimpleNamespace(close=lambda: order.append("csv_close"))
+        node._publish = lambda val, *args: order.append("zero")
+        with mock.patch.object(self.module.time, "sleep", lambda _: None):
+            node.shutdown()
+        self.assertEqual(order[:10], ["zero"] * 10)
+        self.assertEqual(order[10:], ["udp_stop", "raw_close", "csv_close"])
+
     def test_stream_fault_revokes_arm_and_commands_zero(self):
         node = self.make_node()
         node._g10_status = lambda now: (False, "stale_packets")
