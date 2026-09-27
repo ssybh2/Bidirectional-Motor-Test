@@ -553,17 +553,20 @@ class BidirectionalMotorTest(Node):
                     self._log_result(result)
 
     def shutdown(self):
-        if self.g10 is not None:
-            self.g10.stop()
-        if self.raw_capture is not None:
-            self.raw_capture.close()
+        # SAFETY: attempt zero commands BEFORE waiting for UDP/CSV I/O.
+        # Closing a raw CSV writer can block for many seconds; it must never
+        # precede best-effort ESC stopping.
         self.wave.stop()
-        # Best-effort only: a crash, OS hang, DDS loss, or slave-side latch
-        # can retain the last command. A separate hardware stop is necessary.
-        for _ in range(10):
-            self._publish(0, "SHUTDOWN", 0.0, 0, 0.0)
-            time.sleep(0.01)
-        self.logs.close()
+        try:
+            for _ in range(10):
+                self._publish(0, "SHUTDOWN", 0.0, 0, 0.0)
+                time.sleep(0.01)
+        finally:
+            if self.g10 is not None:
+                self.g10.stop()
+            if self.raw_capture is not None:
+                self.raw_capture.close()
+            self.logs.close()
 
 
 def main(args=None):
