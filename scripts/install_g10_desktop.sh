@@ -7,16 +7,17 @@ if [[ "${EUID}" -eq 0 ]]; then
 fi
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCH="$REPO/scripts/launch_g10_desktop.sh"
+ROS_HELPER="$REPO/scripts/ros_env_exec.sh"
 WORKSPACE="$(cd -- "$REPO/.." && pwd)"
 if [[ ! -f "$WORKSPACE/install/setup.bash" ]]; then
   echo "Build the ROS workspace first: colcon build --symlink-install --packages-up-to bidirectional_motor_test" >&2
   exit 1
 fi
-if ! python3 -c "import tkinter" >/dev/null 2>&1; then
+if ! /usr/bin/python3 -c "import tkinter" >/dev/null 2>&1; then
   echo "Tkinter is missing. Install it: sudo apt install python3-tk" >&2
   exit 1
 fi
-chmod u+x "$LAUNCH"
+chmod u+x "$LAUNCH" "$ROS_HELPER"
 mkdir -p "$HOME/.local/share/applications"
 DEST="$HOME/.local/share/applications/bidirectional-g10.desktop"
 cat > "$DEST" <<EOF
@@ -26,6 +27,7 @@ Version=1.0
 Name=G10 推力测量
 Comment=G10 UDP & ROS 2 live measurements
 Exec=$LAUNCH
+TryExec=$LAUNCH
 Path=$REPO
 Icon=utilities-system-monitor
 Terminal=false
@@ -40,5 +42,6 @@ if [[ -d "$HOME/Desktop" ]]; then
     >/dev/null 2>&1 || true
 fi
 echo "Installed: $DEST"
+echo "GUI launcher log: ${XDG_STATE_HOME:-$HOME/.local/state}/bidirectional-g10/dashboard-launch.log"
 echo "Open Applications and search for G10 推力测量."
 echo "On some Ubuntu desktops, right-click the desktop icon and Allow Launching."

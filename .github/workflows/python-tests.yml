@@ -42,3 +42,9 @@ jobs:
           root.destroy()
           print("G10 Tk GUI window smoke test: passed")
           PY
+      - name: Launch actual desktop script without ROS installed
+        run: |
+          export XDG_STATE_HOME="$(mktemp -d)"
+          xvfb-run -a env G10_GUI_SMOKE_TEST=1 bash scripts/launch_g10_desktop.sh
+          grep -q 'GUI exited normally' "$XDG_STATE_HOME/bidirectional-g10/dashboard-launch.log"
+          echo 'G10 desktop .sh startup: passed (ROS not sourced)'

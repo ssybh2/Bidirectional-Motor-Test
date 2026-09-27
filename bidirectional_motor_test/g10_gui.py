@@ -45,6 +45,19 @@ FONT = "Noto Sans CJK SC"
 ROS_NODE = "/bidirectional_motor_test"
 LOG_DIR = Path(os.environ.get(
     "G10_LOG_DIR", "~/bidirectional/measurements")).expanduser()
+REPO_DIR = Path(os.environ.get(
+    "G10_REPO", Path(__file__).resolve().parents[1])).expanduser()
+ROS_HELPER = Path(os.environ.get(
+    "G10_ROS_HELPER", REPO_DIR / "scripts/ros_env_exec.sh")).expanduser()
+
+
+def ros_command(*args):
+    """Only ROS-dependent actions load ROS, never the GUI startup itself."""
+    if ROS_HELPER.is_file():
+        return [str(ROS_HELPER), *args]
+    # This fallback supports 'ros2 run g10_dashboard' from a sourced
+    # terminal when the source-repository scripts are unavailable.
+    return list(args)
 
 
 class Dashboard:
@@ -401,8 +414,8 @@ class Dashboard:
             handle = open(self.own_log, "a", encoding="utf-8")
             try:
                 self.own_proc = subprocess.Popen(
-                    ["ros2", "launch", "bidirectional_motor_test",
-                     "motor_test.launch.py"],
+                    ros_command("ros2", "launch", "bidirectional_motor_test",
+                                "motor_test.launch.py"),
                     stdin=subprocess.DEVNULL, stdout=handle,
                     stderr=subprocess.STDOUT, start_new_session=True)
             finally:
@@ -448,7 +461,7 @@ class Dashboard:
         def worker():
             try:
                 result = subprocess.run(
-                    args, capture_output=True, text=True,
+                    ros_command(*args), capture_output=True, text=True,
                     timeout=timeout, check=False)
                 output = (result.stdout + "\n" + result.stderr).strip()
                 self.root.after(
@@ -563,6 +576,10 @@ def main():
     except tk.TclError:
         pass
     Dashboard(root)
+    # Used solely by CI to exercise the installed .desktop startup path
+    # under a virtual X display, without ROS or an actual G10.
+    if os.environ.get("G10_GUI_SMOKE_TEST") == "1":
+        root.after(350, root.destroy)
     root.mainloop()
 
 

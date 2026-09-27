@@ -28,6 +28,14 @@ bash scripts/install_g10_desktop.sh
 
 之后从 Ubuntu 应用列表搜索 **G10 推力测量**，点击即可打开窗口；如果桌面也生成图标，首次可能需要右键 **允许启动（Allow Launching）**。如果不想安装快捷方式，也可以在已 source 的 ROS 终端执行一次 `ros2 run bidirectional_motor_test g10_dashboard` 打开窗口，以后所有数据和操作都在 GUI 内。
 
+GUI **打开窗口本身不再依赖加载 ROS 2 环境**。桌面启动脚本先打开 Tk；只有点击启动采集、去皮或标定，才通过 `scripts/ros_env_exec.sh` 加载 ROS 环境并执行相应命令。如果 Ubuntu 图标点击无窗口，启动器会记录 Python 堆栈，并通过系统对话框/通知提示失败原因。查询最近一次启动日志：
+
+```bash
+tail -n 90 "${XDG_STATE_HOME:-$HOME/.local/state}/bidirectional-g10/dashboard-launch.log"
+```
+
+如需直接看启动报错，也可用 `bash scripts/launch_g10_desktop.sh`。用 `bash scripts/install_g10_desktop.sh` 更新桌面快捷方式；安装脚本会给 ROS 环境帮助脚本添加执行权限。
+
 GUI 可以监测**已经运行的** `motor_test.launch.py`，或者点击 **启动采集** 来启动自己的 ROS 节点；它会先检查 G10 本地 IP 和 UDP 端口，避免与 `g10_probe`/其他节点争抢。点击 **停止采集** 只会关闭 GUI **自己启动的**节点，关闭窗口时也先请求该节点正常停机。对于在其他终端启动的节点，GUI 仅附着监看，不擅自停止。不要把软件停止按钮当成硬件急停。
 
 - **去皮**：先卸载、静止两秒，确保遥控器开关 2、DSHOT 0、ESC 动力断开，点击 `空载去皮`；小于几个 ADC 计数的量化波动是正常的。
