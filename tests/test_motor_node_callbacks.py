@@ -100,6 +100,24 @@ class NodeTickTests(unittest.TestCase):
         self.assertEqual(order[:10], ["zero"] * 10)
         self.assertEqual(order[10:], ["udp_stop", "raw_close", "csv_close"])
 
+    def test_health_disables_output_for_stale_force_or_disk_failure(self):
+        node = self.make_node()
+        node.g10 = types.SimpleNamespace(
+            error=None, packets=types.SimpleNamespace(qsize=lambda: 0))
+        node.g10_last_received_ns = time.monotonic_ns()
+        node.g10_no_packet_timeout_ns = 150_000_000
+        node.g10_max_queue_backlog = 24
+        node.force_max_age_ns = 250_000_000
+        node.last_force_ns = time.monotonic_ns() - 300_000_000
+        ready, reason = node.__class__._g10_status(node, time.monotonic_ns())
+        self.assertFalse(ready)
+        self.assertEqual(reason, "force_samples_stale")
+        node.last_force_ns = time.monotonic_ns()
+        node.raw_capture = types.SimpleNamespace(error=IOError("disk full"))
+        ready, reason = node.__class__._g10_status(node, time.monotonic_ns())
+        self.assertFalse(ready)
+        self.assertEqual(reason, "receiver_error")
+
     def test_stream_fault_revokes_arm_and_commands_zero(self):
         node = self.make_node()
         node._g10_status = lambda now: (False, "stale_packets")
