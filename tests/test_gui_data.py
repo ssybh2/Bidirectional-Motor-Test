@@ -5,7 +5,8 @@ import tempfile
 import unittest
 
 from bidirectional_motor_test.gui_data import (
-    acquisition_fresh, last_row, latest_session, parse_channels, parse_force,
+    acquisition_fresh, collector_command_fresh, last_row,
+    latest_control_command, latest_session, parse_channels, parse_force,
     plot_limits, recent_rows, stream_fresh,
 )
 
@@ -43,6 +44,29 @@ class DesktopDataTests(unittest.TestCase):
             self.assertFalse(acquisition_fresh(control, now=2.0))
             self.assertFalse(stream_fresh(prefix, now=2.0))
             self.assertFalse(acquisition_fresh(prefix, now=10.0))
+
+    def test_live_dshot_comes_from_controller_not_g10_force_copy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            # G10's last_dshot remains zero without controller metadata.
+            g10 = root / "g10_001_force.csv"
+            g10.write_text(
+                "mono_ns,raw_force,forward_positive_force,force_unit,last_dshot\n"
+                "1,32688,0,raw_count,0\n")
+            control = root / "control_002_command.csv"
+            control.write_text("mono_ns,dshot,mode\n100,1250,SINE\n")
+            os.utime(control, ns=(2 * 10**9, 2 * 10**9))
+            self.assertEqual(
+                latest_control_command(root, now=2.0)["dshot"], 1250)
+            self.assertEqual(
+                latest_control_command(root, now=2.0)["mode"], "SINE")
+            self.assertFalse(
+                collector_command_fresh(str(root / "g10_001"), now=2.0))
+            self.assertIsNone(latest_control_command(root, now=6.0))
+            # A malformed or stale command must not be displayed as zero.
+            control.write_text("mono_ns,dshot,mode\n101,bogus,SINE\n")
+            os.utime(control, ns=(2 * 10**9, 2 * 10**9))
+            self.assertIsNone(latest_control_command(root, now=2.0))
 
     def test_tail_rejects_partial_rows_and_missing_files(self):
         with tempfile.TemporaryDirectory() as folder:

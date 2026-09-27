@@ -21,6 +21,8 @@ def main():
         folder = Path(home)
         with mock.patch.object(g10_gui, "LOG_DIR", folder):
             logs = SessionLogs(folder, "raw_count", prefix_tag="g10")
+            control_logs = SessionLogs(
+                folder, "raw_count", prefix_tag="control")
             try:
                 initial = time.monotonic_ns()
                 logs.write(
@@ -40,6 +42,16 @@ def main():
                     app = g10_gui.Dashboard(root)
                     root.update_idletasks()
                     root.update()
+                    # The G10 force CSV's last_dshot is zero here, but
+                    # Motor Test has issued a nonzero command independently.
+                    control_logs.write(
+                        "command", wall_ns=time.time_ns(),
+                        mono_ns=time.monotonic_ns(), mode="SINE", channel=1,
+                        dshot=1250, sine=.5, logical_direction=1,
+                        phase_rad=.5, last_force="", force_unit="raw_count")
+                    app._refresh()
+                    assert app.dshot_value.get() == "1250"
+                    assert app.mode_value.get() == "SINE"
                     assert app.btn_record_start.winfo_ismapped()
                     assert app.btn_record_stop.winfo_ismapped()
                     app.record_dir = folder / "exports"
@@ -98,6 +110,7 @@ def main():
                             "(one ZIP, DSHOT, force, onset)")
                     root.destroy()
             finally:
+                control_logs.close()
                 logs.close()
 
 

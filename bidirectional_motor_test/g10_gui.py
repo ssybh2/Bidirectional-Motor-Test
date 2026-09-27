@@ -28,7 +28,8 @@ except ImportError as exc:
     ) from exc
 
 from .gui_data import (
-    acquisition_fresh, last_row, latest_session, parse_channels, parse_force,
+    acquisition_fresh, collector_command_fresh, last_row,
+    latest_control_command, latest_session, parse_channels, parse_force,
     plot_limits, recent_rows, stream_fresh,
 )
 from .session_export import export_recording, ExportError
@@ -95,7 +96,7 @@ class Dashboard:
         self.mass_var = tk.StringVar(value="")
         self.main_value = tk.StringVar(value="—")
         self.raw_value = tk.StringVar(value="—")
-        self.dshot_value = tk.StringVar(value="0")
+        self.dshot_value = tk.StringVar(value="—")
         self.stream_value = tk.StringVar(value="等待数据")
         self.unit_value = tk.StringVar(value="raw_count")
         self.mode_value = tk.StringVar(value="—")
@@ -338,6 +339,15 @@ class Dashboard:
         if self.closing:
             return
         try:
+            # Motor control and G10 acquisition are separate processes.
+            # Display the controller's authoritative published-command log,
+            # even before GUI acquisition starts. A missing log is unknown,
+            # NEVER a fabricated DSHOT 0.
+            control = latest_control_command(LOG_DIR)
+            self.dshot_value.set(
+                str(control["dshot"]) if control is not None else "—")
+            self.mode_value.set(
+                control["mode"] if control is not None else "—")
             prefix = latest_session(LOG_DIR)
             if prefix != self.prefix:
                 self.prefix = prefix
@@ -350,7 +360,7 @@ class Dashboard:
             else:
                 healthy = stream_fresh(prefix)
                 self.connection.config(
-                    text="● UDP / ROS 数据在线" if healthy else
+                    text="● G10 UDP 数据在线" if healthy else
                          "● 数据已停止",
                     fg=GREEN if healthy else AMBER)
                 rows = recent_rows(prefix + "_force.csv")
@@ -376,7 +386,8 @@ class Dashboard:
                         self.main_value.set("%+.3f" % force)
                         self.unit_value.set(unit)
                         self.raw_value.set("%.0f" % raw)
-                        self.dshot_value.set(str(dshot))
+                        # force.csv stores the collector's last seen command.
+                        # It is NOT the authoritative live DSHOT display.
                 channel_row = last_row(prefix, "g10_channels")
                 if channel_row is not None:
                     numbers = parse_channels(channel_row)
@@ -393,12 +404,17 @@ class Dashboard:
                         self.stream_value.set("正常")
                     else:
                         self.stream_value.set("未就绪")
+                    # G10 UDP readiness says nothing about whether control
+                    # metadata reached the separate acquisition node.
+                    # Without this metadata ZIP timing cannot be trusted.
+                    metadata_fresh = (
+                        control is not None and collector_command_fresh(prefix))
                     self.age_value.set(
-                        "%s · 丢包 %s" %
-                        (reason, quality.get("queue_dropped", "?")))
-                mode = last_row(prefix, "command")
-                if mode is not None:
-                    self.mode_value.set(mode.get("mode", "—"))
+                        "%s · 丢包 %s · %s" %
+                        (reason, quality.get("queue_dropped", "?"),
+                         "指令元数据在线" if metadata_fresh else
+                         "指令元数据未同步"))
+
                 if not healthy and self.own_proc is None:
                     self._set_note(
                         "最近 G10 会话已停止；点击“启动采集”，Motor Test 独立运行。")

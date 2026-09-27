@@ -32,6 +32,41 @@ def latest_session(directory):
     return newest
 
 
+def latest_control_command(directory, max_age_sec=2.0, now=None):
+    """Read the command actually published by Motor Test, not G10's copy.
+
+    A missing, unreadable or stale controller command is UNKNOWN, not zero.
+    No ROS initialization or UDP socket is needed in the Tk process.
+    """
+    root = Path(directory).expanduser()
+    if not root.is_dir():
+        return None
+    newest = None
+    newest_mtime = -1
+    for item in root.glob("control_*_command.csv"):
+        try:
+            mtime_ns = item.stat().st_mtime_ns
+        except OSError:
+            continue
+        if mtime_ns > newest_mtime:
+            newest, newest_mtime = item, mtime_ns
+    if newest is None or not _file_fresh(newest, max_age_sec, now):
+        return None
+    rows = recent_rows(newest, max_bytes=8192)
+    if not rows:
+        return None
+    row = rows[-1]
+    try:
+        dshot = int(row["dshot"])
+        stamp = int(row["mono_ns"])
+        mode = str(row["mode"]).strip()
+        if dshot not in range(2048) or stamp <= 0 or not mode:
+            return None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    return {"dshot": dshot, "mode": mode, "mono_ns": stamp}
+
+
 def recent_rows(path, max_bytes=16_384):
     """Read only a bounded tail; discard incomplete trailing rows.
 
@@ -100,6 +135,20 @@ def acquisition_fresh(prefix, max_age_sec=3.0, now=None):
     """
     return _file_fresh(
         str(prefix) + "_g10_quality.csv", max_age_sec, now)
+
+
+def collector_command_fresh(prefix, max_age_sec=2.0, now=None):
+    """G10 collector has recently received a real controller command."""
+    path = str(prefix) + "_command.csv"
+    if not _file_fresh(path, max_age_sec, now):
+        return False
+    row = last_row(prefix, "command")
+    if row is None:
+        return False
+    try:
+        return int(row["mono_ns"]) > 0 and 0 <= int(row["dshot"]) <= 2047
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def parse_force(row):

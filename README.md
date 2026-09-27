@@ -147,3 +147,33 @@ bash /home/hby/bidirectional/Bidirectional-Motor-Test/scripts/launch_g10_desktop
 采集服务用指令元数据中的原始发布时刻，与缓存的 G10 原生样本做时间关联。元数据缺失、推力基线不新鲜时**不伪造测量结果**，现有 CSV/ZIP 导出格式保持不变。
 
 **安全变化：** 现在 G10 数据中断或 GUI 停止采集 **不会令 Motor Test 停机**。GUI 的「停止采集」不是急停，正式带桨测试必须具备独立物理急停、RPM 停转联锁和下位机失联清零措施。Ctrl+C 时若 ROS 上下文已失效，软件也无法保证最后的 DSHOT 0 已发布。
+
+## 7. GUI 的 DSHOT 显示与 G10 指令元数据诊断
+
+控制节点和采集节点拆分后，GUI「当前 DSHOT」直接读取 **Motor Test 产生的** `control_*_command.csv` 最新有效记录，而不是 G10 `force.csv` 中可能滞后的 `last_dshot`。因此，即使 GUI 尚未点击「启动采集」，依然可以读取已经运行的控制日志并显示 DSHOT。控制日志缺失、不可读或超过两秒未更新时显示 **—（未知）**，不能用 0 假装停机。这里显示的是 ROS **已发布的命令**，不是从 ESC 读取的真实输出或转速。
+
+G10 接收器仍然通过 ROS `/bidirectional_motor_test/command_meta` 获取精确的发送时间戳，供指令与推力延迟分析使用。GUI 采集状态会单独显示「指令元数据在线」或「指令元数据未同步」。**G10 UDP 正常不代表 ROS 指令元数据已经同步**：若后者异常，实时推力仍可显示，但不应把该会话用于可信的 DSHOT→推力延迟结论。
+
+排查时，在同一 Ubuntu 主机检查：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/hby/one/install/setup.bash
+source /home/hby/bidirectional/install/setup.bash
+
+# Motor Test 的命令总线：在开关 2/3/1 变化时看 dshot 与 mode
+ros2 topic info /bidirectional_motor_test/command_meta -v
+ros2 topic echo /bidirectional_motor_test/command_meta --once
+
+# 两个进程使用同一个 ROS_DOMAIN_ID / 兼容的 RMW 实现
+printenv ROS_DOMAIN_ID RMW_IMPLEMENTATION
+# GUI 启动的采集使用 scripts/ros_env_exec.sh 加载 ROS 环境
+
+# 分别检查控制方和采集方最后一行（按文件修改时间排序）
+find /home/hby/bidirectional/measurements -maxdepth 1 \
+  -name 'control_*_command.csv' -printf '%T@ %p\n' | sort -nr | head -1
+find /home/hby/bidirectional/measurements -maxdepth 1 \
+  -name 'g10_*_command.csv' -printf '%T@ %p\n' | sort -nr | head -1
+```
+
+如果控制 CSV 非零、采集 CSV 始终空白，说明实时显示问题和 ROS 元数据传输问题是两回事。优先检查 root 和普通用户进程的 ROS_DOMAIN_ID/RMW 是否一致、`ros2 topic info -v` 的 publisher/subscriber 计数，以及普通用户是否对 `control_*_command.csv` 具有读取权限。不要仅凭 `SINE` 模式判定某一瞬间的 DSHOT 必定非零：换向等待与正弦死区本来就会输出零。
