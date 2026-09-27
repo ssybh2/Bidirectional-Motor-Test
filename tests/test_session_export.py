@@ -284,6 +284,28 @@ class RecordingExportTests(unittest.TestCase):
                 mono + 200_000_000, wall)[0],
             current.prefix)
 
+    def test_timebase_regressions_reported_without_inventing_samples(self):
+        self.write_command(200, 1100, 1)
+        self.write_force(201, 9)
+        for stamp, regressions in ((150, 123), (250, 140)):
+            self.logs.write(
+                "g10_quality", mono_ns=stamp, wall_ns=3000 + stamp,
+                stream_ready=1, reason="ready",
+                last_receive_age_ms=2, decoded_packets=1,
+                invalid_packets=0, queue_dropped=0,
+                sequence_gap_events=0,
+                timestamp_regressions=regressions,
+                queue_backlog=0, zero_samples=10000,
+                raw_windows_dropped=0)
+        result = export_recording(
+            self.logs.prefix, self.output, 100, 300,
+            started_wall_ns=1_790_495_000_000_000_000)
+        self.assertEqual(result["metadata"]["g10_timebase_regressions"], 17)
+        self.assertTrue(any("regressed" in w for w in result["warnings"]))
+        with zipfile.ZipFile(result["path"]) as archive:
+            meta = json.loads(archive.read("metadata.json"))
+            self.assertEqual(meta["g10_timebase_regressions"], 17)
+
     def test_no_force_or_missing_folder_never_write_success_archive(self):
         self.write_command(200, 1100, 1)
         with self.assertRaisesRegex(ExportError, "No force samples"):

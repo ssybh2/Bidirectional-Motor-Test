@@ -457,6 +457,33 @@ def export_recording(prefix, destination, start_ns, stop_ns,
                     raw_event_paths.append(target)
                 else:
                     raw_missing.append(event_id)
+            # Packet sample times are estimated independently from UDP
+            # receive timestamps. Jitter can make adjacent packet estimates
+            # overlap. Earlier samples discarded by the collector cannot
+            # be recreated from this ZIP or assumed to have 0 ms latency.
+            quality = list(_read_written(files["g10_quality"]))
+            def counter_delta(field):
+                if len(quality) < 2:
+                    return None
+                first = _valid_int(quality[0].get(field))
+                last = _valid_int(quality[-1].get(field))
+                return max(0, last - first) if (
+                    first is not None and last is not None) else None
+
+            timebase_regressions = counter_delta("timestamp_regressions")
+            udp_queue_drops = counter_delta("queue_dropped")
+            udp_sequence_gaps = counter_delta("sequence_gap_events")
+            if timebase_regressions:
+                warnings.append(
+                    "G10 estimated sample timestamps regressed %d times; "
+                    "affected samples were rejected. Sub-millisecond "
+                    "latency accuracy is NOT established."
+                    % timebase_regressions)
+            if udp_queue_drops or udp_sequence_gaps:
+                warnings.append(
+                    "G10 transport loss: queue_drops=%s, "
+                    "sequence_gap_events=%s" %
+                    (udp_queue_drops, udp_sequence_gaps))
             metadata = {
                 "schema_version": 1,
                 "source_session": prefix.name,
@@ -473,6 +500,9 @@ def export_recording(prefix, destination, start_ns, stop_ns,
                     Path(controller).name if controller else None),
                 "recovered_control_references": recovered,
                 "data_integrity_warnings": warnings,
+                "g10_timebase_regressions": timebase_regressions,
+                "g10_udp_queue_drops": udp_queue_drops,
+                "g10_sequence_gap_events": udp_sequence_gaps,
                 "latency_status": (
                     "detected" if onset else
                     "not_measured" if not counts["latency"] else

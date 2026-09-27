@@ -9,6 +9,7 @@ import queue
 import sys
 import time
 from collections import deque
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -416,7 +417,7 @@ class BidirectionalMotorTest(Node):
 
     def _recover_control_csv(self, now_ns):
         prefix, rows = recent_control_metadata(
-            __import__("pathlib").Path(self.logs.prefix).parent, now_ns)
+            Path(self.logs.prefix).parent, now_ns)
         if prefix is None:
             return
         for item in rows:
