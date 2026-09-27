@@ -81,6 +81,19 @@ class CaptureSeparationTests(unittest.TestCase):
         self.assertEqual([
             row["mono_ns"] for kind, row in node.rows if kind == "command"], [t0])
 
+    def test_disarm_cancels_incomplete_latency_without_motor_publish(self):
+        node = self.make_capture()
+        t0 = time.monotonic_ns() - 10_000_000
+        node.latency.start(1, t0, 1, 0.0)
+        node._publish = lambda *args: self.fail("collector emitted DSHOT")
+        node._on_control_meta(types.SimpleNamespace(data=json.dumps({
+            "type": "command", "mono_ns": t0,
+            "wall_ns": time.time_ns(), "dshot": 0, "mode": "DISARM",
+            "channel": 1, "sine": 0, "direction": 0, "phase": 0,
+        })))
+        self.assertIsNone(node.latency.pending)
+        self.assertEqual(node.last_mode, "DISARM")
+
     def test_stale_or_active_command_disables_calibration(self):
         node = self.make_capture()
         node.g10_enabled = True
