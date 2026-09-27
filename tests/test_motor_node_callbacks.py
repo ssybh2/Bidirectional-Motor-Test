@@ -5,6 +5,7 @@ Hardware, real DDS, UDP startup and physical timing are NOT covered.
 """
 
 import importlib
+import queue
 import sys
 import tempfile
 import time
@@ -47,6 +48,7 @@ class NodeTickTests(unittest.TestCase):
     def make_node(self):
         node = object.__new__(self.module.BidirectionalMotorTest)
         node.g10_enabled = True
+        node.g10_adc_modulo = True
         node.g10_require_healthy = True
         node.g10_auto_zero = True
         node.g10_zero_count = 100
@@ -153,6 +155,91 @@ class NodeTickTests(unittest.TestCase):
             None, types.SimpleNamespace(success=False, message=""))
         self.assertFalse(response.success)
         self.assertIn("stop the motor", response.message)
+
+    def test_real_udp_decoder_to_force_handles_signed16_rollover(self):
+        node = self.make_node()
+        node.g10 = types.SimpleNamespace(packets=queue.Queue())
+        node.g10_adc_channel = 6
+        node.g10_zero_raw = 32688.0
+        node.g10_kgf_per_count = 0.0
+        node.g10_force_sign = -1
+        node.g10_sample_period_ns = 100_000
+        node.g10_arrival_bias_ns = 0
+        node.g10_last_sequence = None
+        node.g10_sequence_gaps = 0
+        node.g10_max_packets_per_poll = 6
+        node.g10_channel_log_decimation = 1
+        node.g10_log_decimation = 40
+        node.g10_packet_count = 0
+        node.g10_sample_count = 0
+        node.g10_calibration_window = StableADCWindow(
+            sample_period_ns=100_000, window_sec=.1)
+        node.last_force = None
+        node.last_force_ns = None
+        node.last_command = 0
+        written = []
+        node.logs = types.SimpleNamespace(
+            write=lambda kind, **row: written.append((kind, row)))
+        now = time.monotonic_ns()
+
+        def samples(raw):
+            return tuple(
+                tuple(raw if channel == 6 else 0 for channel in range(8))
+                for _ in range(40))
+
+        def feed(raw, sequence):
+            packet = types.SimpleNamespace(
+                sequence=sequence, samples=samples(raw),
+                sample_timestamps=lambda t, period, bias:
+                tuple(t - bias - 39 * period + i * period
+                      for i in range(40)))
+            node.g10.packets.put((now + sequence * 5_000_000, packet))
+            node._drain_g10()
+            return node.last_force
+
+        # Physically one direction: raw decreases, positive in this setup.
+        self.assertEqual(feed(31088, 1), +1600)
+        # Opposite direction: ADC crosses the int16 representation edge.
+        # Old code wrongly computed about +65,000 counts here.
+        self.assertEqual(feed(-32648, 2), -200)
+        adc_rows = [row for kind, row in written if kind == "force"]
+        self.assertEqual(adc_rows[0]["raw_force"], 31088)
+        self.assertEqual(adc_rows[-1]["raw_force"], -32648)
+        self.assertEqual(adc_rows[-1]["forward_positive_force"], -200)
+
+    def test_auto_zero_does_not_average_across_int16_gap(self):
+        node = self.make_node()
+        node.g10 = types.SimpleNamespace(packets=queue.Queue())
+        node.g10_adc_channel = 6
+        node.g10_force_sign = -1
+        node.g10_auto_zero = True
+        node.g10_auto_zero_samples = 40
+        node.g10_zero_count = 0
+        node.g10_zero_reference = None
+        node.g10_zero_sum = 0.0
+        node.g10_sample_period_ns = 100_000
+        node.g10_arrival_bias_ns = 0
+        node.g10_last_sequence = None
+        node.g10_sequence_gaps = 0
+        node.g10_max_packets_per_poll = 6
+        node.g10_channel_log_decimation = 1
+        node.g10_packet_count = 0
+        node.g10_calibration_window = StableADCWindow(
+            sample_period_ns=100_000, window_sec=.1)
+        node.logs = types.SimpleNamespace(write=lambda *a, **kw: None)
+        raw_values = (32766, 32767, -32768, -32767) * 10
+        packet = types.SimpleNamespace(
+            sequence=1,
+            samples=tuple(
+                tuple(raw if ch == 6 else 0 for ch in range(8))
+                for raw in raw_values),
+            sample_timestamps=lambda recv, period, bias:
+            tuple(recv - bias - 39 * period + i * period
+                  for i in range(40)))
+        node.g10.packets.put((time.monotonic_ns(), packet))
+        node._drain_g10()
+        self.assertEqual(node.g10_zero_count, 40)
+        self.assertAlmostEqual(node.g10_zero_raw, 32767.5)
 
     def test_udp_event_starts_real_latency_tracker(self):
         node = self.make_node()

@@ -73,6 +73,10 @@ class DesktopDataTests(unittest.TestCase):
         low, high = plot_limits([-2.0, 5.0])
         self.assertLess(low, -2)
         self.assertGreater(high, 5)
+        self.assertEqual(low, -high)
+        # Positive-only readings still plot against a centered zero line.
+        low, high = plot_limits([0.1, 0.2])
+        self.assertEqual(low, -high)
         low, high = plot_limits([5.0, 5.0])
         self.assertLess(low, 0)
         self.assertGreater(high, 5)

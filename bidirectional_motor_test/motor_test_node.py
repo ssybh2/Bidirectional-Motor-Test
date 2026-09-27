@@ -17,8 +17,8 @@ from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 from .core import SineDshot, SwitchInterlock
 from .g10_udp import G10UDPReceiver
 from .g10_calibration import (
-    CalibrationError, StableADCWindow, load_scale, save_scale,
-    scale_for_known_mass,
+    CalibrationError, StableADCWindow, adc_delta, load_scale, save_scale,
+    scale_for_known_mass, wrap_signed16,
 )
 from .g10_health import baseline_ready, g10_health
 from .latency import ThrustLatency
@@ -66,6 +66,7 @@ class BidirectionalMotorTest(Node):
             "g10_auto_zero_samples": 10000,
             "g10_zero_raw": 0.0,
             "g10_force_sign": -1,
+            "g10_adc_signed16_modulo": True,
             "g10_kgf_per_count": 0.0,
             "g10_load_calibration": True,
             "g10_calibration_file": "~/bidirectional/calibration/g10_channel6.json",
@@ -110,6 +111,7 @@ class BidirectionalMotorTest(Node):
         self.g10_auto_zero_samples = int(p["g10_auto_zero_samples"])
         self.g10_zero_raw = float(p["g10_zero_raw"])
         self.g10_force_sign = int(p["g10_force_sign"])
+        self.g10_adc_modulo = bool(p["g10_adc_signed16_modulo"])
         self.g10_kgf_per_count = float(p["g10_kgf_per_count"])
         self.g10_calibration_file = str(p["g10_calibration_file"])
         self.g10_load_calibration = bool(p["g10_load_calibration"])
@@ -186,9 +188,18 @@ class BidirectionalMotorTest(Node):
 
         if (self.g10_enabled and self.g10_load_calibration and
                 self.g10_kgf_per_count == 0):
-            stored = load_scale(
-                self.g10_calibration_file, self.g10_device_ip,
-                self.g10_adc_channel, self.g10_force_sign)
+            try:
+                stored = load_scale(
+                    self.g10_calibration_file, self.g10_device_ip,
+                    self.g10_adc_channel, self.g10_force_sign,
+                    modulo_signed16=self.g10_adc_modulo)
+            except CalibrationError as exc:
+                # Legacy linear gains may have incorporated the +/-32768
+                # representation jump. Never silently reuse them.
+                stored = None
+                self.get_logger().warn(
+                    "G10 saved calibration is incompatible (%s). "
+                    "Using raw_count until a new known-mass calibration." % exc)
             if stored is not None:
                 self.g10_kgf_per_count = stored
                 self.get_logger().info(
@@ -245,6 +256,7 @@ class BidirectionalMotorTest(Node):
         self.event_id = 0
         self.g10 = None
         self.g10_zero_sum = 0.0
+        self.g10_zero_reference = None
         self.g10_zero_count = 0
         self.g10_sample_count = 0
         self.g10_packet_count = 0
@@ -310,6 +322,10 @@ class BidirectionalMotorTest(Node):
             "1=SINE. No rotor-stop guarantee without RPM feedback. "
             "Never treat ROS alone as an emergency stop.")
         if self.g10 is not None:
+            self.get_logger().info(
+                "G10 ADC signed16 modulo relative correction=%s "
+                "(reverse polarity and actual range require static validation)" %
+                self.g10_adc_modulo)
             self.get_logger().info(
                 "direct G10 UDP enabled: %s:%d, ADC channel %d, %s" %
                 (p["g10_bind_host"], p["g10_udp_port"], self.g10_adc_channel,
@@ -489,11 +505,18 @@ class BidirectionalMotorTest(Node):
                 self.g10_calibration_window.add(sample_ns, raw)
                 if (self.g10_auto_zero and
                         self.g10_zero_count < self.g10_auto_zero_samples):
-                    self.g10_zero_sum += raw
+                    if self.g10_zero_reference is None:
+                        self.g10_zero_reference = raw
+                    self.g10_zero_sum += (
+                        self.g10_zero_reference + adc_delta(
+                            raw, self.g10_zero_reference,
+                            modulo_signed16=self.g10_adc_modulo))
                     self.g10_zero_count += 1
                     if self.g10_zero_count == self.g10_auto_zero_samples:
+                        mean_zero = self.g10_zero_sum / self.g10_zero_count
                         self.g10_zero_raw = (
-                            self.g10_zero_sum / self.g10_zero_count)
+                            wrap_signed16(mean_zero)
+                            if self.g10_adc_modulo else mean_zero)
                         self.get_logger().info(
                             "G10 auto-zero complete: %.6f raw counts" %
                             self.g10_zero_raw)
@@ -506,7 +529,10 @@ class BidirectionalMotorTest(Node):
                     continue
                 scale = (self.g10_kgf_per_count
                          if self.g10_kgf_per_count > 0 else 1.0)
-                force = self.g10_force_sign * (raw - self.g10_zero_raw) * scale
+                force = (
+                    self.g10_force_sign *
+                    adc_delta(raw, self.g10_zero_raw,
+                              modulo_signed16=self.g10_adc_modulo) * scale)
                 self.g10_sample_count += 1
                 if self.raw_capture is not None:
                     self.raw_capture.add(
@@ -531,7 +557,8 @@ class BidirectionalMotorTest(Node):
             raise CalibrationError("G10 stream not ready: " + reason)
         return self.g10_calibration_window.snapshot(
             time.monotonic_ns(), self.g10_no_packet_timeout_ns,
-            self.g10_stability_range_counts)
+            self.g10_stability_range_counts,
+            modulo_signed16=self.g10_adc_modulo)
 
     def _on_g10_tare(self, request, response):
         """Capture a fresh stable *unloaded* mean, without changing gain."""
@@ -564,11 +591,13 @@ class BidirectionalMotorTest(Node):
                 "g10_calibration_mass_kg").value)
             scale, delta = scale_for_known_mass(
                 mass_kg, mean, self.g10_zero_raw,
-                self.g10_force_sign)
+                self.g10_force_sign,
+                modulo_signed16=self.g10_adc_modulo)
             save_scale(
                 self.g10_calibration_file, self.g10_device_ip,
                 self.g10_adc_channel, self.g10_force_sign,
-                scale, mass_kg, delta)
+                scale, mass_kg, delta,
+                modulo_signed16=self.g10_adc_modulo)
             self.g10_kgf_per_count = scale
             self.force_unit = "kgf"
             self.logs.force_unit = "kgf"

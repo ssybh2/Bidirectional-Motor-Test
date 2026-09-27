@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 from pathlib import Path
 import time
 
@@ -109,11 +110,15 @@ def parse_channels(row):
 
 
 def plot_limits(points):
-    """Padded plot range; always includes the zero-force reference."""
+    """Symmetric autoscale about force=0, using observed samples as-is.
+
+    Both positive and negative thrust get the same vertical scale; never
+    manufacture a negative signal or hide outliers by clipping.
+    """
     if not points:
         return -1.0, 1.0
-    low, high = min(points), max(points)
-    low, high = min(low, 0.0), max(high, 0.0)
-    span = max(high - low, 1.0)
-    padding = span * 0.14
-    return low - padding, high + padding
+    extent = max(abs(value) for value in points)
+    if not math.isfinite(extent):
+        return -1.0, 1.0
+    half = max(1.0, extent * 1.15)
+    return -half, half

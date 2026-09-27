@@ -54,6 +54,11 @@ bidirectional_motor_test:
     g10_auto_zero_samples: 10000  # 1 s; bench must be unloaded at startup
     g10_zero_raw: 0.0
     g10_force_sign: -1
+    # Hypothesis: signed-int16 UDP ADC wraps at +32767/-32768.
+    # Use shortest modulo-65536 difference relative to the tare zero so
+    # both physical directions can produce opposite signs. MUST validate
+    # with unloaded, gentle manual push/pull and raw ADC traces.
+    g10_adc_signed16_modulo: true
     g10_kgf_per_count: 0.0   # optional manual gain, overrides saved gain
     # Runtime services: /bidirectional_motor_test/g10_tare and g10_calibrate.
     # Save only gain to disk; each startup still needs a fresh zero.

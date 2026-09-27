@@ -154,8 +154,8 @@ class Dashboard:
         self.graph.pack(fill="both", expand=True)
         bottom = tk.Frame(chart_panel, bg=SURFACE)
         bottom.pack(fill="x", pady=(9, 0))
-        self._txt(bottom, "● 推力 / 零点校正后", 10, CYAN).pack(side="left")
-        self._txt(bottom, "显示单位取自 CSV；未标定时不是 kgf",
+        self._txt(bottom, "● 正向 +  /  反向 −  · 零点在中央", 10, CYAN).pack(side="left")
+        self._txt(bottom, "仅按 ADC 测量符号显示；未标定时不是 kgf",
                   10, MUTED).pack(side="right")
 
         channels = tk.Frame(
@@ -183,7 +183,9 @@ class Dashboard:
             self._txt(cell, "", 14, INK, bold=True, textvariable=var).pack(
                 anchor="w", pady=(4, 0))
         tk.Frame(channels, bg=SURFACE, height=13).pack()
-        self._txt(channels, "注意：ADC 6 反向量程/编码尚待验证。",
+        self._txt(channels,
+                  "原始 ADC 可跨越 ±32768；推力曲线按相对零点计算。"
+                  "反向编码和实际受力仍需双向静态验证。",
                   10, AMBER, wraplength=275, justify="left").pack(
                 anchor="w")
 
