@@ -37,8 +37,8 @@ g10_acquisition:
     g10_raw_sign_threshold: 8.0
     # Opposite DSHOT t0 -> sustained opposite G10 thrust sign.
     # This measurement-only threshold does not change motor safety.
-    g10_reversal_raw_sign_threshold: 4.0
-    g10_reversal_stable_sec: 0.2
+    g10_reversal_raw_sign_threshold: 0.01
+    g10_reversal_stable_sec: 0.01
     g10_log_decimation: 40
     g10_channel_log_decimation: 4
     g10_require_healthy: false

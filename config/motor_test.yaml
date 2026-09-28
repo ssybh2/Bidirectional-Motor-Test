@@ -9,31 +9,27 @@ bidirectional_motor_test:
     # 2=DISARM, 3=ARMED (DSHOT 0), 1=RUN selected waveform.
     # sine (default): existing phase-frozen sine wave, fully unchanged.
     # step: hold an EQUAL 3D magnitude, then alternate direction.
-    waveform_mode: "sine"
+    waveform_mode: "step"
 
     # Original sine mode (unaffected by step parameters).
     # The phase is frozen during reversal pauses; wall-time waveform
     # intentionally has zero-output plateaus near every sign change.
     sine_frequency_hz: 0.05
-    sine_deadband: 0.08
+    sine_deadband: 0.0
     positive_peak_dshot: 1250
     negative_peak_dshot: 250
     invert_direction: false
-    reversal_pause_sec: 2.0
+    invert_direction: false
 
-    # Step mode: to select, set waveform_mode: "step".
-    # These two 3D DSHOT codes have EQUAL offsets (1250-1048=250-48).
-    # Each nonzero value is held for step_hold_sec before a reversal.
+    # 原有正弦模式的换向等待时间
+    reversal_pause_sec: 0.0
+
+    # 新增 STEP 模式参数
     step_forward_dshot: 1250
     step_reverse_dshot: 250
     step_hold_sec: 2.0
-    # SAFE DEFAULT: sends DSHOT 0 between opposite commands, so a
-    # 2-second hold + 2-second pause gives 4-second actual switches.
-    step_reversal_pause_sec: 2.0
-    # DANGEROUS EXPERIMENTAL OPTION: set pause to 0.0 AND opt in here
-    # for 1250 -> 250 without an intervening DSHOT 0. Do not use on
-    # unrestrained propellers or without a physical ESC stop.
-    step_allow_direct_reversal: false
+    step_reversal_pause_sec: 0.0
+    step_allow_direct_reversal: true
 
     run_reentry_pause_sec: 2.0
     publish_rate_hz: 50.0
