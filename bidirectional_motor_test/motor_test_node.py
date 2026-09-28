@@ -19,7 +19,7 @@ from std_msgs.msg import Float64, String
 from std_srvs.srv import Trigger
 from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 
-from .core import SineDshot, StepDshot, SwitchInterlock
+from .core import RampDshot, SineDshot, StepDshot, SwitchInterlock
 from .control_recovery import recent_control_metadata
 from .g10_udp import G10UDPReceiver, G10SequenceClock
 from .g10_calibration import (
@@ -58,6 +58,12 @@ class BidirectionalMotorTest(Node):
             # 0.0 requires explicit step_allow_direct_reversal=true.
             "step_reversal_pause_sec": 2.0,
             "step_allow_direct_reversal": False,
+            # Linear in 3D DSHOT command offset (NOT linear physical thrust).
+            "ramp_rise_sec": 2.0,
+            "ramp_fall_sec": 2.0,
+            "ramp_positive_hold_sec": 2.0,
+            "ramp_negative_hold_sec": 2.0,
+            "ramp_zero_pause_sec": 0.0,
             "run_reentry_pause_sec": 2.0,
             "publish_rate_hz": 50.0,
             "rc_timeout_sec": 0.25,
@@ -116,8 +122,8 @@ class BidirectionalMotorTest(Node):
 
         self.command_meta_topic = str(p["command_meta_topic"])
         self.waveform_mode = str(p["waveform_mode"]).strip().lower()
-        if self.waveform_mode not in ("sine", "step"):
-            raise ValueError("waveform_mode must be sine or step")
+        if self.waveform_mode not in ("sine", "step", "ramp"):
+            raise ValueError("waveform_mode must be sine, step or ramp")
         self.channel = int(p["motor_channel"])
         self.rc_timeout_ns = int(float(p["rc_timeout_sec"]) * 1e9)
         self.force_max_age_ns = int(float(p["force_sample_max_age_sec"]) * 1e9)
@@ -271,7 +277,7 @@ class BidirectionalMotorTest(Node):
                 reversal_pause_sec=float(p["reversal_pause_sec"]),
                 invert_direction=bool(p["invert_direction"]),
             )
-        else:
+        elif self.waveform_mode == "step":
             if float(p["step_hold_sec"]) < 1.0 / rate:
                 raise ValueError(
                     "step_hold_sec cannot be shorter than DSHOT publish period")
@@ -284,6 +290,26 @@ class BidirectionalMotorTest(Node):
                     p["step_allow_direct_reversal"]),
                 invert_direction=bool(p["invert_direction"]),
             )
+        else:
+            self.wave = RampDshot(
+                positive_peak=int(p["positive_peak_dshot"]),
+                negative_peak=int(p["negative_peak_dshot"]),
+                rise_sec=float(p["ramp_rise_sec"]),
+                fall_sec=float(p["ramp_fall_sec"]),
+                positive_hold_sec=float(p["ramp_positive_hold_sec"]),
+                negative_hold_sec=float(p["ramp_negative_hold_sec"]),
+                zero_pause_sec=float(p["ramp_zero_pause_sec"]),
+                invert_direction=bool(p["invert_direction"]),
+            )
+            # Every half-slope needs multiple control-timer samples.
+            # Reject settings that would silently degenerate into a step.
+            if min(self.wave.rise_positive_ns,
+                   self.wave.rise_negative_ns,
+                   self.wave.fall_positive_ns,
+                   self.wave.fall_negative_ns) < 2e9 / rate:
+                raise ValueError(
+                    "ramp slope is too fast for publish_rate_hz; "
+                    "increase ramp_rise_sec/ramp_fall_sec or publish_rate_hz")
         self.reversal_detector = (
             ReversalDirectionTracker(
                 sign_threshold=self.g10_reversal_raw_sign_threshold *
@@ -551,7 +577,7 @@ class BidirectionalMotorTest(Node):
                 self.last_mode = mode
                 # Cancel incomplete response estimates if RC disarms/stops.
                 # Stopping G10 capture itself never publishes DSHOT.
-                if mode not in ("SINE", "STEP"):
+                if mode not in ("SINE", "STEP", "RAMP"):
                     self.latency.cancel()
                     if self.reversal_detector is not None:
                         for result in self.reversal_detector.cancel(
@@ -571,7 +597,7 @@ class BidirectionalMotorTest(Node):
                 direction = int(event["direction"])
                 if (matching is None or matching != (
                         str(event["mode"]), int(event["dshot"]), direction)
-                        or str(event["mode"]) not in ("SINE", "STEP")
+                        or str(event["mode"]) not in ("SINE", "STEP", "RAMP")
                         or direction not in (-1, 1)):
                     return
                 seen = getattr(self, "seen_reference_stamps", None)
@@ -1112,8 +1138,8 @@ class BidirectionalMotorTest(Node):
             if self.wave.running:
                 self.last_wave_stopped_ns = now
                 self._log_event(
-                    "sine_stopped" if self.waveform_mode == "sine"
-                    else "step_stopped", mode=mode, now_ns=now)
+                    self.waveform_mode + "_stopped",
+                    mode=mode, now_ns=now)
             self.wave.stop()
             self.latency.cancel()
             self._publish(0, mode, 0.0, 0, 0.0)
@@ -1132,13 +1158,11 @@ class BidirectionalMotorTest(Node):
                 return
             self.wave.start(now)
             self._log_event(
-                "sine_started" if self.waveform_mode == "sine"
-                else "step_started",
-                mode="SINE" if self.waveform_mode == "sine" else "STEP",
-                now_ns=now)
+                self.waveform_mode + "_started",
+                mode=self.waveform_mode.upper(), now_ns=now)
 
         wave = self.wave.step(now, rpm_ready=self._rpm_ready(now))
-        command_mode = ("SINE" if self.waveform_mode == "sine" else "STEP")
+        command_mode = self.waveform_mode.upper()
         send_ns = self._publish(
             wave.dshot, command_mode, wave.sine, wave.direction,
             wave.phase_rad)

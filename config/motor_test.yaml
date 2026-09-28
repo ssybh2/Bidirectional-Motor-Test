@@ -7,8 +7,9 @@ bidirectional_motor_test:
 
     # RC authorization is unchanged in BOTH modes:
     # 2=DISARM, 3=ARMED (DSHOT 0), 1=RUN selected waveform.
-    # sine (default): existing phase-frozen sine wave, fully unchanged.
-    # step: hold an EQUAL 3D magnitude, then alternate direction.
+    # sine: original phase-frozen sine wave; step: original fixed 3D command.
+    # ramp: trapezoid, linear command slopes + configurable high/low holds.
+    # Keep step selected unless deliberately changing experiments.
     waveform_mode: "step"
 
     # Original sine mode (unaffected by step parameters).
@@ -30,6 +31,21 @@ bidirectional_motor_test:
     step_hold_sec: 2.0
     step_reversal_pause_sec: 0.0
     step_allow_direct_reversal: true
+
+    # RAMP MODE (enable by setting waveform_mode: "ramp" above).
+    # Uses positive_peak_dshot=1250 and negative_peak_dshot=250 above.
+    # Full valley-to-peak rise takes 2s; full peak-to-valley fall takes 2s.
+    # Each slope crosses the 3D neutral boundary with DSHOT 0.
+    # Initially ramps from zero to the positive peak over HALF the rise time
+    # for equal positive/negative command spans.
+    ramp_rise_sec: 2.0
+    ramp_fall_sec: 2.0
+    # Plateau durations are separate; set negative hold to 0 for no valley hold.
+    ramp_positive_hold_sec: 2.0
+    ramp_negative_hold_sec: 2.0
+    # Additional DSHOT-0 crossing pause; 0 still sends >=1 zero packet.
+    # A real RPM interlock, if enabled, can extend this pause.
+    ramp_zero_pause_sec: 0.0
 
     run_reentry_pause_sec: 2.0
     publish_rate_hz: 50.0

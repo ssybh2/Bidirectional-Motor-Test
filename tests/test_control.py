@@ -1,7 +1,7 @@
 import unittest
 
 from bidirectional_motor_test.core import (
-    ARM, DISARM, RUN, SineDshot, StepDshot, SwitchInterlock,
+    ARM, DISARM, RUN, RampDshot, SineDshot, StepDshot, SwitchInterlock,
 )
 from bidirectional_motor_test.latency import ThrustLatency
 
@@ -185,6 +185,156 @@ class StepTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     StepDshot(**kwargs)
+
+
+class RampTests(unittest.TestCase):
+    def test_linear_slopes_peak_holds_and_real_neutral_command(self):
+        ramp = RampDshot(
+            positive_peak=1250, negative_peak=250,
+            rise_sec=2.0, fall_sec=2.0,
+            positive_hold_sec=2.0, negative_hold_sec=2.0)
+        ramp.start(0)
+        self.assertEqual(ramp.step(0).dshot, 0)
+        halfway = ramp.step(500_000_000)
+        self.assertEqual((halfway.dshot, halfway.event),
+                         (1149, "first_command"))
+        self.assertAlmostEqual(halfway.sine, 0.5)
+        self.assertEqual(ramp.step(SECOND).dshot, 1250)
+        self.assertEqual(ramp.step(2 * SECOND).dshot, 1250)
+        self.assertEqual(ramp.step(3 * SECOND).dshot, 1250)
+        self.assertEqual(ramp.step(3_500_000_000).dshot, 1149)
+        neutral = ramp.step(4 * SECOND)
+        self.assertEqual((neutral.dshot, neutral.direction),
+                         (0, 0))
+        self.assertEqual(neutral.event, "zero_crossing")
+        reverse = ramp.step(4_020_000_000)
+        self.assertEqual(reverse.direction, -1)
+        self.assertEqual(reverse.event, "reversal_command")
+        self.assertEqual(reverse.dshot, 52)
+        self.assertEqual(ramp.step(5_020_000_000).dshot, 250)
+        self.assertEqual(ramp.step(7_020_000_000).dshot, 250)
+        self.assertEqual(ramp.step(7_520_000_000).dshot, 149)
+        self.assertEqual(ramp.step(8_020_000_000).dshot, 0)
+        again = ramp.step(8_040_000_000)
+        self.assertEqual(
+            (again.dshot, again.direction, again.event),
+            (1052, 1, "reversal_command"))
+        ramp.stop()
+        self.assertEqual(ramp.step(10 * SECOND).dshot, 0)
+
+    def test_rise_and_fall_can_have_different_slopes(self):
+        ramp = RampDshot(
+            rise_sec=1.0, fall_sec=3.0,
+            positive_hold_sec=2.0, negative_hold_sec=0.0)
+        self.assertEqual(ramp.rise_positive_ns, 500_000_000)
+        self.assertEqual(ramp.rise_negative_ns, 500_000_000)
+        self.assertEqual(ramp.fall_positive_ns, 1_500_000_000)
+        self.assertEqual(ramp.fall_negative_ns, 1_500_000_000)
+        ramp.start(0)
+        self.assertEqual(ramp.step(250_000_000).sine, 0.5)
+        self.assertEqual(ramp.step(500_000_000).dshot, 1250)
+        self.assertEqual(ramp.step(2_500_000_000).dshot, 1250)
+        self.assertEqual(ramp.step(3_250_000_000).sine, 0.5)
+        self.assertEqual(ramp.step(4 * SECOND).dshot, 0)
+        self.assertEqual(ramp.step(4_020_000_000).event,
+                         "reversal_command")
+        self.assertEqual(ramp.step(5_520_000_000).dshot, 250)
+        # Zero-duration valley holds still emit the valley at least once.
+        self.assertEqual(ramp.step(5_540_000_000).dshot, 250)
+
+    def test_wait_for_real_rpm_at_zero_instead_of_skipping_it(self):
+        ramp = RampDshot(
+            rise_sec=2.0, fall_sec=2.0,
+            positive_hold_sec=2.0, negative_hold_sec=2.0)
+        ramp.start(0)
+        ramp.step(SECOND)
+        ramp.step(3 * SECOND)
+        self.assertEqual(ramp.step(4 * SECOND).dshot, 0)
+        waiting = ramp.step(4_020_000_000, rpm_ready=False)
+        self.assertEqual((waiting.dshot, waiting.event),
+                         (0, "waiting_for_rpm"))
+        self.assertEqual(
+            ramp.step(8 * SECOND, rpm_ready=False).dshot, 0)
+        self.assertEqual(ramp.step(9 * SECOND, rpm_ready=True).dshot, 0)
+        reversed_now = ramp.step(9_020_000_000, rpm_ready=True)
+        self.assertEqual((reversed_now.direction, reversed_now.event),
+                         (-1, "reversal_command"))
+        self.assertLess(reversed_now.dshot, 100)
+
+    def test_configurable_neutral_hold(self):
+        ramp = RampDshot(
+            rise_sec=2, fall_sec=2, positive_hold_sec=2,
+            zero_pause_sec=0.5)
+        ramp.start(0)
+        ramp.step(SECOND)
+        ramp.step(3 * SECOND)
+        self.assertEqual(ramp.step(4 * SECOND).dshot, 0)
+        self.assertEqual(ramp.step(4_400_000_000).dshot, 0)
+        self.assertEqual(ramp.step(4_500_000_000).dshot, 0)
+        self.assertEqual(ramp.step(4_520_000_000).event,
+                         "reversal_command")
+
+    def test_unequal_peaks_split_full_ramp_in_offset_proportions(self):
+        ramp = RampDshot(
+            positive_peak=1250, negative_peak=148,
+            rise_sec=3, fall_sec=3)
+        self.assertEqual(ramp.positive_span, 202)
+        self.assertEqual(ramp.negative_span, 100)
+        self.assertAlmostEqual(
+            (ramp.fall_positive_ns + ramp.fall_negative_ns) / 1e9,
+            3.0, places=8)
+        self.assertAlmostEqual(
+            ramp.fall_positive_ns / ramp.fall_negative_ns,
+            202 / 100, places=7)
+        ramp.start(0)
+        ramp.step(ramp.rise_positive_ns)
+        self.assertEqual(ramp.step(
+            ramp.rise_positive_ns + ramp.positive_hold_ns).dshot,
+                         1250)
+
+    def test_inversion_changes_only_wire_direction(self):
+        ramp = RampDshot(
+            rise_sec=2, fall_sec=2, invert_direction=True)
+        ramp.start(0)
+        first = ramp.step(500_000_000)
+        self.assertEqual((first.direction, first.dshot, first.event),
+                         (1, 149, "first_command"))
+        ramp.step(SECOND)
+        ramp.step(3 * SECOND)
+        ramp.step(4 * SECOND)
+        reverse = ramp.step(4_020_000_000)
+        self.assertEqual((reverse.direction, reverse.dshot,
+                          reverse.event), (-1, 1052, "reversal_command"))
+
+    def test_overdue_timer_never_skips_zero_or_emits_direct_step(self):
+        ramp = RampDshot(
+            rise_sec=1, fall_sec=1, positive_hold_sec=0,
+            negative_hold_sec=0)
+        ramp.start(0)
+        self.assertEqual(ramp.step(100 * SECOND).dshot, 1250)
+        self.assertEqual(ramp.step(101 * SECOND).dshot, 1250)
+        # The next delayed callback lands at the crossing: zero first.
+        self.assertEqual(ramp.step(200 * SECOND).dshot, 0)
+        following = ramp.step(200 * SECOND + 20_000_000)
+        self.assertTrue(48 < following.dshot < 250)
+        self.assertEqual(following.event, "reversal_command")
+
+    def test_invalid_parameters(self):
+        cases = (
+            {"positive_peak": 1048},
+            {"negative_peak": 48},
+            {"rise_sec": 0},
+            {"fall_sec": -1},
+            {"rise_sec": float("nan")},
+            {"fall_sec": float("inf")},
+            {"positive_hold_sec": -1},
+            {"negative_hold_sec": -0.1},
+            {"zero_pause_sec": -1},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    RampDshot(**kwargs)
 
 
 class LatencyTests(unittest.TestCase):

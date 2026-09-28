@@ -278,6 +278,57 @@ class CaptureSeparationTests(unittest.TestCase):
             finally:
                 ctl.close()
 
+    def test_ramp_reference_survives_both_csv_recovery_and_g10_detection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ctl = SessionLogs(folder, "raw_count", prefix_tag="control")
+            try:
+                node = self.make_capture()
+                node.logs.prefix = str(Path(folder) / "g10_running")
+                t0 = time.monotonic_ns() - 300_000_000
+                node.force_history.append((t0 - 4_000_000, 20.0))
+                node.reversal_packet_history.extend(
+                    [(t0 - 4_000_000, 20.0)] +
+                    [(t0 + t * 1_000_000, -8.0)
+                     for t in range(20, 225, 4)])
+                for stamp, code, direction in (
+                        (t0 - 20_000_000, 0, 0),
+                        (t0, 52, -1)):
+                    ctl.write(
+                        "command", wall_ns=time.time_ns(),
+                        mono_ns=stamp, mode="RAMP", channel=1,
+                        dshot=code, sine=-0.02 if code else 0,
+                        logical_direction=direction, phase_rad=3.18,
+                        last_force="", force_unit="raw_count")
+                ctl.write(
+                    "event", wall_ns=time.time_ns(),
+                    mono_ns=t0, event_id=2,
+                    kind="force_response_reference", mode="RAMP",
+                    dshot=52, sine=-0.02,
+                    detail="reversal_from=1 reversal_to=-1")
+                _, recovered = recent_control_metadata(
+                    folder, time.monotonic_ns())
+                refs = [row for row in recovered
+                        if row["type"] == "reference"]
+                self.assertEqual(len(refs), 1)
+                self.assertEqual(refs[0]["mode"], "RAMP")
+                self.assertTrue(refs[0]["reversal"])
+                self.assertEqual(refs[0]["from_direction"], 1)
+                node._recover_control_csv(time.monotonic_ns())
+                detections = [
+                    row for kind, row in node.rows
+                    if kind == "latency" and
+                    row["metric"] == "force_direction_change"]
+                self.assertEqual(len(detections), 1)
+                self.assertEqual(detections[0]["status"], "detected")
+                self.assertEqual(detections[0]["command_mono_ns"], t0)
+                self.assertEqual(detections[0]["latency_ms"], 20.0)
+                self.assertEqual(node.metadata_source, "control_csv")
+                self.assertEqual(
+                    [row["mode"] for kind, row in node.rows
+                     if kind == "command"], ["RAMP", "RAMP"])
+            finally:
+                ctl.close()
+
     def test_disarm_cancels_incomplete_latency_without_motor_publish(self):
         node = self.make_capture()
         t0 = time.monotonic_ns() - 10_000_000

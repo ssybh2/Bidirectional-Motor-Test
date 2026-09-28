@@ -78,7 +78,7 @@ def recent_control_metadata(directory, now_ns, lookback_ns=2_000_000_000):
             continue
         command = commands.get(stamp)
         if (command is None or event_id <= 0 or
-                command["mode"] not in ("SINE", "STEP") or
+                command["mode"] not in ("SINE", "STEP", "RAMP") or
                 command["dshot"] == 0 or
                 command["direction"] not in (-1, 1)):
             continue

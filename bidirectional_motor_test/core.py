@@ -264,3 +264,176 @@ class StepDshot:
         self.hold_until_ns = now_ns + self.reversal_pause_ns
         return WaveOutput(
             0, 0.0, 0, self.phase_rad, "reversal_pause")
+
+
+
+class RampDshot:
+    """Trapezoidal bidirectional 3D demand with independent up/down slopes.
+
+    Demand is linear in *DSHOT range offset*, NOT calibrated RPM or thrust.
+    From rest: 0 -> positive peak -> positive hold -> 0 -> negative peak
+    -> negative hold -> 0 -> positive peak, repeating.
+
+    A full valley-to-peak rise takes rise_sec; peak-to-valley fall takes
+    fall_sec. Split each slope between sides in proportion to their DSHOT
+    offsets, so unequal positive/negative peaks retain one command slope.
+    Each sign crossing publishes DSHOT 0 for at least one timer tick.
+    Optional zero_pause_sec and rpm_ready hold the crossing at zero. The
+    first OPPOSITE nonzero publish emits reversal_command as in SineDshot.
+    """
+
+    def __init__(self, positive_peak=1250, negative_peak=250,
+                 rise_sec=2.0, fall_sec=2.0,
+                 positive_hold_sec=2.0, negative_hold_sec=2.0,
+                 zero_pause_sec=0.0, invert_direction=False):
+        if not (1049 <= positive_peak <= 2047):
+            raise ValueError("ramp positive_peak_dshot must be in [1049, 2047]")
+        if not (49 <= negative_peak <= 1047):
+            raise ValueError("ramp negative_peak_dshot must be in [49, 1047]")
+        durations = (rise_sec, fall_sec, positive_hold_sec,
+                     negative_hold_sec, zero_pause_sec)
+        if not all(math.isfinite(x) for x in durations):
+            raise ValueError("ramp durations must be finite")
+        if rise_sec <= 0 or fall_sec <= 0:
+            raise ValueError("ramp_rise_sec and ramp_fall_sec must be > 0")
+        if (positive_hold_sec < 0 or negative_hold_sec < 0 or
+                zero_pause_sec < 0):
+            raise ValueError("ramp hold/pause durations must be >= 0")
+        self.positive_span = int(positive_peak) - 1048
+        self.negative_span = int(negative_peak) - 48
+        total_span = self.positive_span + self.negative_span
+        self.rise_positive_ns = round(
+            rise_sec * 1e9 * self.positive_span / total_span)
+        self.rise_negative_ns = round(
+            rise_sec * 1e9 * self.negative_span / total_span)
+        self.fall_positive_ns = round(
+            fall_sec * 1e9 * self.positive_span / total_span)
+        self.fall_negative_ns = round(
+            fall_sec * 1e9 * self.negative_span / total_span)
+        if min(self.rise_positive_ns, self.rise_negative_ns,
+               self.fall_positive_ns, self.fall_negative_ns) < 1:
+            raise ValueError("ramp slope too short for 3D DSHOT amplitudes")
+        self.positive_hold_ns = round(positive_hold_sec * 1e9)
+        self.negative_hold_ns = round(negative_hold_sec * 1e9)
+        self.zero_pause_ns = round(zero_pause_sec * 1e9)
+        self.invert_direction = bool(invert_direction)
+        self.stop()
+
+    def stop(self):
+        self.running = False
+        self.segment = "stopped"
+        self.segment_start_ns = None
+        self.last_ns = None
+        self.last_direction = 0
+        self.waiting_for_rpm = False
+        self.phase_rad = 0.0
+
+    def start(self, now_ns):
+        self.stop()
+        self.running = True
+        self.segment = "initial_rise"
+        self.segment_start_ns = int(now_ns)
+        self.last_ns = int(now_ns)
+
+    def _emit(self, demand, phase_rad, event=""):
+        """demand is in [-1, 1], positive or negative *logical* direction."""
+        self.phase_rad = phase_rad % math.tau
+        demand = max(-1.0, min(1.0, float(demand)))
+        direction = (1 if demand > 0 else -1 if demand < 0 else 0)
+        high_range = (direction > 0) != self.invert_direction
+        if direction == 0:
+            return WaveOutput(0, 0.0, 0, self.phase_rad, event)
+        span = self.positive_span if high_range else self.negative_span
+        offset = round(abs(demand) * span)
+        if offset == 0:
+            return WaveOutput(0, demand, 0, self.phase_rad, event)
+        dshot = (1048 if high_range else 48) + offset
+        if direction != self.last_direction:
+            event = ("first_command" if self.last_direction == 0
+                     else "reversal_command")
+            self.last_direction = direction
+        return WaveOutput(dshot, demand, direction, self.phase_rad, event)
+
+    def _enter(self, segment, now_ns, demand, phase, event=""):
+        self.segment = segment
+        self.segment_start_ns = now_ns
+        return self._emit(demand, phase, event)
+
+    def step(self, now_ns, rpm_ready=True):
+        if not self.running:
+            return WaveOutput(0, 0.0, 0, self.phase_rad)
+        now_ns = max(int(now_ns), self.last_ns)
+        self.last_ns = now_ns
+        elapsed = now_ns - self.segment_start_ns
+        state = self.segment
+
+        if state in ("zero_to_negative", "zero_to_positive"):
+            if elapsed < self.zero_pause_ns:
+                return self._emit(0, self.phase_rad)
+            if not rpm_ready:
+                event = "" if self.waiting_for_rpm else "waiting_for_rpm"
+                self.waiting_for_rpm = True
+                return self._emit(0, self.phase_rad, event)
+            # If no guard/pause was needed, account for the zero command
+            # already published at the previous tick. Otherwise restart
+            # the ramp from zero to prevent a jump after a long wait.
+            resume_ns = (self.segment_start_ns if
+                         not self.waiting_for_rpm and
+                         self.zero_pause_ns == 0 else now_ns)
+            self.waiting_for_rpm = False
+            if state == "zero_to_negative":
+                self.segment = "fall_negative"
+                self.segment_start_ns = resume_ns
+                state = "fall_negative"
+            else:
+                self.segment = "rise_positive"
+                self.segment_start_ns = resume_ns
+                state = "rise_positive"
+            elapsed = now_ns - self.segment_start_ns
+
+        if state in ("initial_rise", "rise_positive"):
+            if elapsed >= self.rise_positive_ns:
+                return self._enter(
+                    "positive_hold", now_ns, 1, math.pi / 2)
+            fraction = elapsed / self.rise_positive_ns
+            return self._emit(fraction, fraction * math.pi / 2)
+
+        if state == "positive_hold":
+            if elapsed >= self.positive_hold_ns:
+                return self._enter(
+                    "fall_positive", now_ns, 1, math.pi / 2)
+            return self._emit(1, math.pi / 2)
+
+        if state == "fall_positive":
+            if elapsed >= self.fall_positive_ns:
+                return self._enter(
+                    "zero_to_negative", now_ns, 0, math.pi,
+                    "zero_crossing")
+            fraction = elapsed / self.fall_positive_ns
+            return self._emit(1 - fraction,
+                              math.pi / 2 + fraction * math.pi / 2)
+
+        if state == "fall_negative":
+            if elapsed >= self.fall_negative_ns:
+                return self._enter(
+                    "negative_hold", now_ns, -1, 3 * math.pi / 2)
+            fraction = elapsed / self.fall_negative_ns
+            return self._emit(-fraction,
+                              math.pi + fraction * math.pi / 2)
+
+        if state == "negative_hold":
+            if elapsed >= self.negative_hold_ns:
+                return self._enter(
+                    "rise_negative", now_ns, -1, 3 * math.pi / 2)
+            return self._emit(-1, 3 * math.pi / 2)
+
+        if state == "rise_negative":
+            if elapsed >= self.rise_negative_ns:
+                return self._enter(
+                    "zero_to_positive", now_ns, 0, 0,
+                    "zero_crossing")
+            fraction = elapsed / self.rise_negative_ns
+            return self._emit(-1 + fraction,
+                              3 * math.pi / 2 + fraction * math.pi / 2)
+
+        raise RuntimeError("unexpected ramp segment: " + state)

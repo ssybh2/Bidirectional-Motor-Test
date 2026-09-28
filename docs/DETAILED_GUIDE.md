@@ -436,3 +436,48 @@ step_allow_direct_reversal: true
 退出模式、RC 超时、RC offline、故障以及节点关闭仍然沿用
 原先的 DSHOT 0 路径。若本地 motor_test.yaml 已修改，请备份，
 先 stash 本地版本、拉取后 pop 并合并检查，不要强制丢弃个人配置。
+
+
+## RAMP 独立斜坡模式
+
+在 config/motor_test.yaml 中设置 waveform_mode: "ramp"；
+原有 "sine" 和 "step" 不变。RAMP 共用同一 RC
+DISARM→ARM→RUN、单通道 DSHOT 发布、metadata/t0 和
+G10 独立采集机制。示例：
+
+~~~yaml
+waveform_mode: "ramp"
+positive_peak_dshot: 1250
+negative_peak_dshot: 250
+ramp_rise_sec: 1.0
+ramp_fall_sec: 3.0
+ramp_positive_hold_sec: 2.0
+ramp_negative_hold_sec: 2.0
+ramp_zero_pause_sec: 0.0
+~~~
+
+从零开始的首次上升占完整谷值到峰值上升时间的
+正向幅值份额。对于 1250/250（正反 offset 都为 202），
+初次上升约 0.5 秒。随后正向保持 2 秒，完整
+正峰→负谷斜降 3 秒，反向保持 2 秒，
+负谷→正峰斜升 1 秒，重复。
+
+实现将变化量放在“带逻辑方向的 3D DSHOT 编码幅值”
+坐标上，分别映射正向 1048..2047 与反向 48..1047；
+中间的逻辑零采用 DSHOT 0 而不是 48 或 1048。
+正反峰编码幅度可不同；两侧时间按各自幅值比例
+分摊，以保证每一条完整 ramp 内编码幅值的变化率
+连续，但每次符号跨越必有至少一个 DSHOT 0 发布周期。
+ROS timer 的周期、下游 ESC 及 RPM 停转联锁可能延长
+真实时间；物理推力或 RPM 不一定为线性波形。
+
+控制端日志的 mode=RAMP，旧有 sine 字段记录
+[-1,+1] 的归一化斜坡需求而**不是正弦信号**。
+换向响应的 t0 是第一条实际发布的新方向非零 DSHOT；
+ROS/控制 CSV 两套 G10 元数据均允许 RAMP。
+如需对比不同斜率的力响应，保留 command.csv、
+原生 force 和各段峰值及时间配置；不应把
+reversal_summary.csv 的换向延迟理解为整个下降斜坡。
+带桨实验前先断开 ESC 动力、拆桨验证命令时序，
+随后按实际 ESC 的 3D 换向、机械固定、电流/温度
+上限及独立急停要求开展受控实验。

@@ -15,7 +15,7 @@ import types
 import unittest
 from unittest import mock
 
-from bidirectional_motor_test.core import SineDshot, StepDshot, SwitchInterlock
+from bidirectional_motor_test.core import RampDshot, SineDshot, StepDshot, SwitchInterlock
 from bidirectional_motor_test.g10_calibration import StableADCWindow
 from bidirectional_motor_test.latency import ThrustLatency
 
@@ -139,6 +139,52 @@ class NodeTickTests(unittest.TestCase):
                          ["STEP", "STEP", "STEP"])
         self.assertEqual([x["dshot"] for x in refs],
                          [1250, 250, 1250])
+
+    def test_ramp_mode_real_tick_references_only_first_new_nonzero(self):
+        node = self.make_node()
+        node.waveform_mode = "ramp"
+        node.wave = RampDshot(
+            positive_peak=1250, negative_peak=250, rise_sec=2,
+            fall_sec=2, positive_hold_sec=2, negative_hold_sec=2)
+        events = []
+        commands = []
+        node._log_event = lambda kind, **kw: events.append((kind, kw))
+        node._publish = lambda value, mode, sine, direction, phase: (
+            commands.append((self.fake_ns, value, mode, direction))
+            or self.fake_ns)
+        node.wave.start(100 * 1_000_000_000)
+        stamps = (
+            100_000, 100_500, 101_000, 103_000,
+            103_500, 104_000, 104_020, 105_020,
+            107_020, 107_520, 108_020, 108_040,
+        )
+        with mock.patch.object(self.module.time, "monotonic_ns",
+                               side_effect=lambda: self.fake_ns):
+            for time_ms in stamps:
+                self.fake_ns = time_ms * 1_000_000
+                node.rc_received_ns = self.fake_ns
+                node.last_force_ns = self.fake_ns
+                node._tick()
+        self.assertEqual([x[2] for x in commands], ["RAMP"] * len(stamps))
+        # Every neutral is a real zero publish, NOT a reversal reference.
+        zeros = [(t, v) for t, v, _, _ in commands if v == 0]
+        self.assertEqual(zeros, [
+            (100_000 * 1_000_000, 0),
+            (104_000 * 1_000_000, 0),
+            (108_020 * 1_000_000, 0)])
+        refs = [
+            row for kind, row in events
+            if kind == "force_response_reference"]
+        self.assertEqual(
+            [(row["now_ns"], row["reversal_from"], row["direction"])
+             for row in refs],
+            [(100_500 * 1_000_000, 0, 1),
+             (104_020 * 1_000_000, 1, -1),
+             (108_040 * 1_000_000, -1, 1)])
+        self.assertEqual(
+            [(row["dshot"], row["mode"]) for row in refs],
+            [(1149, "RAMP"), (52, "RAMP"), (1052, "RAMP")])
+        self.assertEqual(node.event_id, 3)
 
     def test_real_tare_then_known_mass_service_and_persistence(self):
         node = self.make_node()

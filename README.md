@@ -358,3 +358,49 @@ STEP 的发布消息及 event/command 行明确记作 mode=STEP，
 G10 的 ROS 元数据和控制 CSV fallback 已同时支持此模式，
 因此 reversal_summary.csv 可继续关联第一条反向非零 DSHOT
 发布时间。其他参数和具体更新步骤见 docs/DETAILED_GUIDE.md。
+
+
+## 12. RAMP 梯形斜坡换向（独立于原 STEP / SINE）
+
+把 config/motor_test.yaml 的 waveform_mode 改为 "ramp"：
+ 
+~~~yaml
+waveform_mode: "ramp"
+positive_peak_dshot: 1250
+negative_peak_dshot: 250
+ramp_rise_sec: 2.0
+ramp_fall_sec: 2.0
+ramp_positive_hold_sec: 2.0
+ramp_negative_hold_sec: 2.0
+ramp_zero_pause_sec: 0.0
+publish_rate_hz: 50.0
+~~~
+
+此例：从 0 起步逐渐升到正向 1250（初次约 1s）→ 保持
+2s → 线性指令下降，约 2s 后到反向 250（经过 DSHOT 0）→
+保持 2s → 线性上升，约 2s 后回到正向 1250 → 循环。
+上升和下降时间分别可调，例如 rise_sec=1、fall_sec=3；
+数值表示完整的谷值到峰值、峰值到谷值的时长。
+正反峰值使用现有 positive_peak_dshot/negative_peak_dshot；
+原 step_forward_dshot/step_reverse_dshot 仅在 STEP 生效。
+可将 ramp_negative_hold_sec: 0.0 取消谷值平台。
+
+这里的“线性”仅指 3D DSHOT 区间内的**编码幅值**线性，
+不保证电机转速或 G10 推力线性。由于 DSHOT 正、反两侧
+编码区间分开，在每次过零时必定至少发送一轮 DSHOT 0；
+因此编码数值本身不是一条跨越 0 的普通数轴直线。
+调度粒度为 1/publish_rate_hz（50 Hz ≈20 ms）。
+可通过 ramp_zero_pause_sec 设置额外的零指令等待。
+若启用真实 require_rpm_for_reversal 联锁，过零等待优先
+服从 RPM 已停条件；这会延长实际斜坡用时。
+没有可靠 RPM 时，不得将斜坡过零或发送 0 当作转子静止。
+
+DSHOT 日志标识为 RAMP，保留独立 G10 采集、
+control CSV 后备元数据、首次反向非零 DSHOT 的
+reversal_command 和 force_response_reference 时间戳。
+请注意这一 t0 是**已进入新方向的指令**，而不是提前
+开始减速斜坡的时刻；若比较完整动态响应，应同时从
+command.csv 提取斜坡起点和零点。已有
+reversal_summary.csv 报告的是指令侧新方向首次出现
+到 G10 新方向推力被确认的时间，不是整个梯形波
+从峰值降到谷值的历时。SINE/STEP 算法不变。
