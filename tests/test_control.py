@@ -1,7 +1,7 @@
 import unittest
 
 from bidirectional_motor_test.core import (
-    ARM, DISARM, RUN, SineDshot, SwitchInterlock,
+    ARM, DISARM, RUN, SineDshot, StepDshot, SwitchInterlock,
 )
 from bidirectional_motor_test.latency import ThrustLatency
 
@@ -90,6 +90,101 @@ class SineTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     SineDshot(**kwargs)
+
+
+class StepTests(unittest.TestCase):
+    def test_equal_3d_codes_direct_switch_without_zero(self):
+        wave = StepDshot(
+            forward_dshot=1250, reverse_dshot=250, hold_sec=2.0,
+            reversal_pause_sec=0.0, allow_direct_reversal=True)
+        wave.start(0)
+        a = wave.step(0)
+        self.assertEqual((a.dshot, a.direction, a.event),
+                         (1250, 1, "first_command"))
+        self.assertEqual(wave.step(SECOND).dshot, 1250)
+        self.assertEqual(wave.step(2 * SECOND - 1).dshot, 1250)
+        b = wave.step(2 * SECOND)
+        self.assertEqual((b.dshot, b.direction, b.event),
+                         (250, -1, "reversal_command"))
+        self.assertEqual(wave.step(3 * SECOND).dshot, 250)
+        self.assertEqual(wave.step(4 * SECOND).dshot, 1250)
+        self.assertEqual(wave.step(6 * SECOND).dshot, 250)
+        self.assertEqual(wave.step(8 * SECOND).dshot, 1250)
+
+    def test_pause_and_rpm_guard_delay_actual_transition(self):
+        wave = StepDshot(hold_sec=2.0, reversal_pause_sec=0.6)
+        wave.start(0)
+        self.assertEqual(wave.step(0).dshot, 1250)
+        at_switch = wave.step(2 * SECOND)
+        self.assertEqual((at_switch.dshot, at_switch.event),
+                         (0, "reversal_pause"))
+        self.assertEqual(wave.step(2_500_000_000).dshot, 0)
+        waiting = wave.step(2_600_000_000, rpm_ready=False)
+        self.assertEqual((waiting.dshot, waiting.event),
+                         (0, "waiting_for_rpm"))
+        self.assertEqual(wave.step(3 * SECOND, rpm_ready=False).dshot, 0)
+        released = wave.step(3_200_000_000, rpm_ready=True)
+        self.assertEqual((released.dshot, released.event),
+                         (250, "reversal_command"))
+        self.assertEqual(wave.step(4_700_000_000).dshot, 250)
+        self.assertEqual(wave.step(5_200_000_000).dshot, 0)
+
+    def test_direct_mode_cannot_bypass_an_enabled_rpm_guard(self):
+        wave = StepDshot(
+            hold_sec=2.0, reversal_pause_sec=0.0,
+            allow_direct_reversal=True)
+        wave.start(0)
+        self.assertEqual(wave.step(0).dshot, 1250)
+        waiting = wave.step(2 * SECOND, rpm_ready=False)
+        self.assertEqual((waiting.dshot, waiting.event),
+                         (0, "reversal_pause"))
+        self.assertEqual(wave.step(3 * SECOND, rpm_ready=False).dshot, 0)
+        command = wave.step(3_500_000_000, rpm_ready=True)
+        self.assertEqual((command.dshot, command.event),
+                         (250, "reversal_command"))
+
+    def test_disarm_reentry_and_inverted_direction(self):
+        wave = StepDshot(
+            hold_sec=2.0, reversal_pause_sec=0.0,
+            allow_direct_reversal=True, invert_direction=True)
+        wave.start(0)
+        self.assertEqual(wave.step(0).dshot, 250)
+        self.assertEqual(wave.step(0).direction, 1)
+        self.assertEqual(wave.step(2 * SECOND).dshot, 1250)
+        wave.stop()
+        self.assertEqual(wave.step(3 * SECOND).dshot, 0)
+        wave.start(4 * SECOND)
+        again = wave.step(4 * SECOND)
+        self.assertEqual((again.dshot, again.event),
+                         (250, "first_command"))
+
+    def test_late_timer_does_not_generate_catchup_reversals(self):
+        wave = StepDshot(
+            hold_sec=2, reversal_pause_sec=0,
+            allow_direct_reversal=True)
+        wave.start(0)
+        self.assertEqual(wave.step(0).dshot, 1250)
+        self.assertEqual(wave.step(10 * SECOND).dshot, 250)
+        self.assertEqual(wave.step(10 * SECOND + 1).dshot, 250)
+        self.assertEqual(wave.step(11 * SECOND).dshot, 250)
+        self.assertEqual(wave.step(12 * SECOND).dshot, 1250)
+
+    def test_invalid_codes_and_direct_opt_in(self):
+        cases = (
+            dict(forward_dshot=1047),
+            dict(reverse_dshot=1048),
+            dict(forward_dshot=1300, reverse_dshot=250),
+            dict(hold_sec=0),
+            dict(hold_sec=-1),
+            dict(reversal_pause_sec=-1),
+            dict(hold_sec=float("nan")),
+            dict(reversal_pause_sec=float("inf")),
+            dict(reversal_pause_sec=0.0),
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    StepDshot(**kwargs)
 
 
 class LatencyTests(unittest.TestCase):

@@ -15,7 +15,7 @@ import types
 import unittest
 from unittest import mock
 
-from bidirectional_motor_test.core import SineDshot, SwitchInterlock
+from bidirectional_motor_test.core import SineDshot, StepDshot, SwitchInterlock
 from bidirectional_motor_test.g10_calibration import StableADCWindow
 from bidirectional_motor_test.latency import ThrustLatency
 
@@ -52,6 +52,7 @@ class NodeTickTests(unittest.TestCase):
     def make_node(self):
         node = object.__new__(self.module.BidirectionalMotorTest)
         node.acquisition_only = False
+        node.waveform_mode = "sine"
         node.g10_enabled = True
         node.g10_adc_modulo = True
         node.g10_require_healthy = True
@@ -93,6 +94,51 @@ class NodeTickTests(unittest.TestCase):
         node._publish = lambda val, *args: (
             node.published.append(val) or time.monotonic_ns())
         return node
+
+    def test_step_mode_publishes_exact_codes_and_reversal_timestamp(self):
+        node = self.make_node()
+        node.waveform_mode = "step"
+        node.wave = StepDshot(
+            hold_sec=2.0, reversal_pause_sec=0.0,
+            allow_direct_reversal=True,
+            forward_dshot=1250, reverse_dshot=250)
+        events = []
+        commands = []
+        node._log_event = lambda kind, **kw: events.append((kind, kw))
+        node._publish = lambda value, mode, sine, direction, phase: (
+            commands.append((value, mode, sine, direction, phase))
+            or self.fake_ns)
+        node.get_logger = lambda: types.SimpleNamespace(
+            info=lambda *a: None, warn=lambda *a: None)
+        node.last_mode = "SINE"
+        node.last_force_ns = 99 * 1_000_000_000
+        node.rc_received_ns = 100 * 1_000_000_000
+        node.wave.start(100 * 1_000_000_000)
+        with mock.patch.object(self.module.time, "monotonic_ns",
+                               side_effect=lambda: self.fake_ns):
+            for now in (100, 101, 102, 103, 104):
+                self.fake_ns = now * 1_000_000_000
+                node.rc_received_ns = self.fake_ns
+                node.last_force_ns = self.fake_ns
+                node._tick()
+        self.assertEqual(
+            [(x[0], x[1]) for x in commands],
+            [(1250, "STEP"), (1250, "STEP"), (250, "STEP"),
+             (250, "STEP"), (1250, "STEP")])
+        refs = [
+            x for kind, x in events
+            if kind == "force_response_reference"]
+        self.assertEqual(len(refs), 3)
+        self.assertEqual(
+            [x["now_ns"] for x in refs],
+            [100 * 1_000_000_000, 102 * 1_000_000_000,
+             104 * 1_000_000_000])
+        self.assertEqual(
+            [x["reversal_from"] for x in refs], [0, 1, -1])
+        self.assertEqual([x["mode"] for x in refs],
+                         ["STEP", "STEP", "STEP"])
+        self.assertEqual([x["dshot"] for x in refs],
+                         [1250, 250, 1250])
 
     def test_real_tare_then_known_mass_service_and_persistence(self):
         node = self.make_node()

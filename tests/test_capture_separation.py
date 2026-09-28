@@ -211,6 +211,73 @@ class CaptureSeparationTests(unittest.TestCase):
             finally:
                 ctl.close()
 
+    def test_step_reference_replays_g10_reversal_and_never_cancels(self):
+        node = self.make_capture()
+        t0 = time.monotonic_ns() - 300_000_000
+        node.force_history.append((t0 - 4_000_000, 20.0))
+        node.reversal_packet_history.extend(
+            [(t0 - 4_000_000, 20.0)] +
+            [(t0 + t * 1_000_000, -8.0)
+             for t in range(20, 225, 4)])
+        # STEP is a valid active control waveform, not DISARM or STOP.
+        command = dict(
+            type="command", mono_ns=t0, wall_ns=time.time_ns(),
+            dshot=250, mode="STEP", channel=1, sine=-1.0,
+            direction=-1, phase=3.14159)
+        node._on_control_meta(types.SimpleNamespace(
+            data=json.dumps(command)))
+        self.assertEqual(node.last_mode, "STEP")
+        node._on_control_meta(types.SimpleNamespace(data=json.dumps(
+            dict(type="reference", mono_ns=t0, mode="STEP",
+                 dshot=250, sine=-1.0, direction=-1,
+                 control_event_id=2, reversal=True,
+                 from_direction=1))))
+        reversal = [
+            row for kind, row in node.rows
+            if kind == "latency"
+            and row["metric"] == "force_direction_change"]
+        self.assertEqual(len(reversal), 1)
+        self.assertEqual(reversal[0]["status"], "detected")
+        self.assertEqual(reversal[0]["latency_ms"], 20.0)
+        self.assertEqual(reversal[0]["from_direction"], 1)
+        self.assertEqual(reversal[0]["to_direction"], -1)
+        self.assertEqual(
+            [row["mode"] for kind, row in node.rows
+             if kind == "command"], ["STEP"])
+
+    def test_step_control_csv_reference_preserves_first_opposite_t0(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ctl = SessionLogs(folder, "raw_count", prefix_tag="control")
+            try:
+                now = time.monotonic_ns()
+                t0 = now - 40_000_000
+                for ns, code, direct in (
+                        (t0 - 20_000_000, 1250, 1),
+                        (t0, 250, -1)):
+                    ctl.write(
+                        "command", wall_ns=time.time_ns(),
+                        mono_ns=ns, mode="STEP", channel=1,
+                        dshot=code, sine=direct,
+                        logical_direction=direct,
+                        phase_rad=0.0, last_force="",
+                        force_unit="raw_count")
+                ctl.write(
+                    "event", wall_ns=time.time_ns(), mono_ns=t0,
+                    event_id=2, kind="force_response_reference",
+                    mode="STEP", dshot=250, sine=-1,
+                    detail="reversal_from=1 reversal_to=-1")
+                _, recovered = recent_control_metadata(
+                    folder, time.monotonic_ns())
+                references = [x for x in recovered
+                              if x["type"] == "reference"]
+                self.assertEqual(len(references), 1)
+                self.assertEqual(references[0]["mono_ns"], t0)
+                self.assertEqual(references[0]["mode"], "STEP")
+                self.assertTrue(references[0]["reversal"])
+                self.assertEqual(references[0]["from_direction"], 1)
+            finally:
+                ctl.close()
+
     def test_disarm_cancels_incomplete_latency_without_motor_publish(self):
         node = self.make_capture()
         t0 = time.monotonic_ns() - 10_000_000

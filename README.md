@@ -312,3 +312,49 @@ raw_events 原生 ADC 后窗口延长至 force_latency_timeout_sec
 因此可以从真实 ADC 包数据核对持续反向推力的检测过程，
 无需推测缺失的后半段波形。该修改仅增加测量日志，注意
 ZIP 体积和内存占用会相应增加。
+
+
+## 11. 新增恒值交替 DSHOT STEP 模式（原正弦模式仍为默认）
+
+Motor Test 共用原本的 WriteDSHOT 发布路径、50 Hz 定时器、RC
+DISARM→ARM→RUN 授权、DSHOT 0 失控处理、事件时间戳及 G10
+独立采集。修改 config/motor_test.yaml 的 waveform_mode 可在
+sine（默认，原功能完全保留）和 step（恒值交替）之间切换。
+
+STEP 的基础参数（与正弦模式互不干扰）：
+
+~~~yaml
+waveform_mode: "step"
+step_forward_dshot: 1250
+step_reverse_dshot: 250
+step_hold_sec: 2.0
+step_reversal_pause_sec: 2.0
+step_allow_direct_reversal: false
+~~~
+
+上面为安全的停转等待配置：正向 2s → DSHOT 0 2s →
+反向 2s → DSHOT 0 2s，以此循环。这里的 1250 和 250
+分别相对于正反向 3D 区间起点 1048、48 偏移 202，
+**只保证相等的 DSHOT 控制量，不保证物理推力相等**。
+实际仍应由 G10 测试台标定和验证。
+
+需要在固定的、具有独立物理急停的安全实验环境中研究
+**正向非零命令直接切换成反向非零命令**，还需显式填写：
+
+~~~yaml
+step_reversal_pause_sec: 0.0
+step_allow_direct_reversal: true
+~~~
+
+此时每 2s 在 1250 与 250 间切换，不发中间 DSHOT 0，
+但实际时间会受 ROS timer 调度粒度影响。RPM 联锁若启用且
+未通过，始终优先保持 0 直至停转条件通过。该直接换向
+**不证明电机已停转或 ESC/桨叶能够承受突然反转**；
+首次验证请断开 ESC 动力、拆桨，在 ROS 话题及 command.csv
+中检查正反编码和对应 reversal_command 事件。
+RC 2/3 停机、RC 断线或超时的零指令逻辑保持不变。
+
+STEP 的发布消息及 event/command 行明确记作 mode=STEP，
+G10 的 ROS 元数据和控制 CSV fallback 已同时支持此模式，
+因此 reversal_summary.csv 可继续关联第一条反向非零 DSHOT
+发布时间。其他参数和具体更新步骤见 docs/DETAILED_GUIDE.md。

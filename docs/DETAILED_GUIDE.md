@@ -380,3 +380,59 @@ python3 -m unittest discover -s tests -v
 ```
 
 单元测试不等于实机验证，尤其不验证 ESC 参数、RPM 数据方向、G10 采集链路或物理换向安全。
+
+
+## 恒值交替的 DSHOT STEP 模式
+
+正常情况下 `waveform_mode: "sine"`，原有的 SineDshot 波形、参数、
+遥控器 2→3→1 联锁、G10 测量、输出话题和 CSV/ZIP 全部保留。
+设置 `waveform_mode: "step"` 后，控制器换用 StepDshot，但继续
+通过同一个 `_publish()`、`WriteDSHOT` 消息及单调时钟记录发指令时间。
+`command.csv` 的 `mode` 变为 `STEP`，G10 的 ROS 元数据和控制 CSV
+补偿恢复都认识这一模式；`reversal_command` 和
+`force_response_reference` 的时戳是第一条真正的反向非零 DSHOT
+指令的**发布时间**。
+
+以下示例保存原来的正弦配置，不会修改 sine 参数：
+
+```yaml
+waveform_mode: "step"
+step_forward_dshot: 1250
+step_reverse_dshot: 250
+step_hold_sec: 2.0
+step_reversal_pause_sec: 2.0
+step_allow_direct_reversal: false
+```
+
+三维 DSHOT 的两侧零附近编码分别从 1048 和 48 开始，因此
+`1250-1048=250-48=202`，这是**等控制量幅值**，而不是
+保证正反推力或 RPM 物理值严格相等。程序拒绝不相等的两组命令。
+如需改成正向 1300，反向必须同步改成 300。
+
+默认先正向 1250 保持 2 秒，发送零指令保持 2 秒，然后反向
+250 保持 2 秒，再发送零指令 2 秒。停转前轮可能仍在旋转；
+零指令和固定等待**不能证明**电机已经停止。启用真实
+`require_rpm_for_reversal` 时，即使暂停时间结束，RPM 未达到
+稳定停转条件也持续发送零指令。
+
+仅对已固定且防护充分的实验台，如果明确希望无零间隔地进行
+非零到非零阶跃，可在 STEP 模式下同时设置：
+
+```yaml
+step_reversal_pause_sec: 0.0
+step_allow_direct_reversal: true
+```
+
+此时 `1250 → 250 → 1250` 按 `step_hold_sec` 交替，
+切换精度受 `publish_rate_hz` 定时器粒度影响（默认 50Hz，
+通常约 20ms）。若 RPM 联锁未就绪，即使配置直接切换，
+状态机仍发送零指令并等待 RPM 条件满足。**这不保证电调允许
+带转速反向切换，也不保证有机械/电气承受能力。**
+仅为脱桨、断开 ESC 动力的指令层测试时，可首先验证
+`command.csv` 连续跳变、`event.csv` 的事件计数、控制元数据
+是否被 G10 采集端正确识别。实际接桨前应核对 ESC 3D 模式、
+电机固定、载荷/保护、电源、真实 RPM 停转和独立急停。
+
+退出模式、RC 超时、RC offline、故障以及节点关闭仍然沿用
+原先的 DSHOT 0 路径。若本地 motor_test.yaml 已修改，请备份，
+先 stash 本地版本、拉取后 pop 并合并检查，不要强制丢弃个人配置。

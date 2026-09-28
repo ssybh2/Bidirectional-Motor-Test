@@ -19,7 +19,7 @@ from std_msgs.msg import Float64, String
 from std_srvs.srv import Trigger
 from custom_msgs.msg import ReadDJIRC, WriteDSHOT
 
-from .core import SineDshot, SwitchInterlock
+from .core import SineDshot, StepDshot, SwitchInterlock
 from .control_recovery import recent_control_metadata
 from .g10_udp import G10UDPReceiver, G10SequenceClock
 from .g10_calibration import (
@@ -42,12 +42,22 @@ class BidirectionalMotorTest(Node):
             "input_topic": "/ecat/sn2555957/app1/read",
             "output_topic": "/ecat/sn2555957/app2/write",
             "motor_channel": 1,
+            # The RC 2 -> 3 -> 1 authorization works for BOTH waveforms.
+            "waveform_mode": "sine",
             "sine_frequency_hz": 0.05,
             "sine_deadband": 0.08,
             "positive_peak_dshot": 1250,
             "negative_peak_dshot": 250,
             "invert_direction": False,
             "reversal_pause_sec": 2.0,
+            # Fixed equal 3D magnitude: forward - reverse MUST equal 1000.
+            "step_forward_dshot": 1250,
+            "step_reverse_dshot": 250,
+            "step_hold_sec": 2.0,
+            # Safe default has a zero-command interval before direction flips.
+            # 0.0 requires explicit step_allow_direct_reversal=true.
+            "step_reversal_pause_sec": 2.0,
+            "step_allow_direct_reversal": False,
             "run_reentry_pause_sec": 2.0,
             "publish_rate_hz": 50.0,
             "rc_timeout_sec": 0.25,
@@ -105,6 +115,9 @@ class BidirectionalMotorTest(Node):
         p = {key: self.get_parameter(key).value for key in defaults}
 
         self.command_meta_topic = str(p["command_meta_topic"])
+        self.waveform_mode = str(p["waveform_mode"]).strip().lower()
+        if self.waveform_mode not in ("sine", "step"):
+            raise ValueError("waveform_mode must be sine or step")
         self.channel = int(p["motor_channel"])
         self.rc_timeout_ns = int(float(p["rc_timeout_sec"]) * 1e9)
         self.force_max_age_ns = int(float(p["force_sample_max_age_sec"]) * 1e9)
@@ -248,14 +261,29 @@ class BidirectionalMotorTest(Node):
             self.force_unit = ("kgf" if self.g10_kgf_per_count > 0
                                else "raw_count")
 
-        self.wave = SineDshot(
-            frequency_hz=float(p["sine_frequency_hz"]),
-            deadband=float(p["sine_deadband"]),
-            positive_peak=int(p["positive_peak_dshot"]),
-            negative_peak=int(p["negative_peak_dshot"]),
-            reversal_pause_sec=float(p["reversal_pause_sec"]),
-            invert_direction=bool(p["invert_direction"]),
-        )
+        if self.waveform_mode == "sine":
+            # Preserve the original sine algorithm and all its parameters.
+            self.wave = SineDshot(
+                frequency_hz=float(p["sine_frequency_hz"]),
+                deadband=float(p["sine_deadband"]),
+                positive_peak=int(p["positive_peak_dshot"]),
+                negative_peak=int(p["negative_peak_dshot"]),
+                reversal_pause_sec=float(p["reversal_pause_sec"]),
+                invert_direction=bool(p["invert_direction"]),
+            )
+        else:
+            if float(p["step_hold_sec"]) < 1.0 / rate:
+                raise ValueError(
+                    "step_hold_sec cannot be shorter than DSHOT publish period")
+            self.wave = StepDshot(
+                forward_dshot=int(p["step_forward_dshot"]),
+                reverse_dshot=int(p["step_reverse_dshot"]),
+                hold_sec=float(p["step_hold_sec"]),
+                reversal_pause_sec=float(p["step_reversal_pause_sec"]),
+                allow_direct_reversal=bool(
+                    p["step_allow_direct_reversal"]),
+                invert_direction=bool(p["invert_direction"]),
+            )
         self.reversal_detector = (
             ReversalDirectionTracker(
                 sign_threshold=self.g10_reversal_raw_sign_threshold *
@@ -390,6 +418,17 @@ class BidirectionalMotorTest(Node):
         else:
             self._publish(0, "STARTUP", 0.0, 0, 0.0)
             self.get_logger().info(
+                "waveform_mode=%s, DSHOT publish_rate=%.3f Hz" %
+                (self.waveform_mode, rate))
+            if (self.waveform_mode == "step" and
+                    self.wave.allow_direct_reversal):
+                self.get_logger().warn(
+                    "DIRECT 3D STEP REVERSAL ENABLED: opposite nonzero "
+                    "DSHOT is sent without a zero interval if RPM guard "
+                    "is ready. Verify ESC bidirectional 3D support and "
+                    "independent physical emergency stop; this does NOT "
+                    "verify rotor stop, and high inertia can cause damage.")
+            self.get_logger().info(
                 "DJIRC=%s, DSHOT=%s, force=%s, rpm=%s, CSV=%s" %
                 (p["input_topic"], p["output_topic"],
                  self.force_topic or "(not connected)",
@@ -512,7 +551,7 @@ class BidirectionalMotorTest(Node):
                 self.last_mode = mode
                 # Cancel incomplete response estimates if RC disarms/stops.
                 # Stopping G10 capture itself never publishes DSHOT.
-                if mode != "SINE":
+                if mode not in ("SINE", "STEP"):
                     self.latency.cancel()
                     if self.reversal_detector is not None:
                         for result in self.reversal_detector.cancel(
@@ -531,7 +570,8 @@ class BidirectionalMotorTest(Node):
                 matching = signatures.get(stamp)
                 direction = int(event["direction"])
                 if (matching is None or matching != (
-                        "SINE", int(event["dshot"]), direction)
+                        str(event["mode"]), int(event["dshot"]), direction)
+                        or str(event["mode"]) not in ("SINE", "STEP")
                         or direction not in (-1, 1)):
                     return
                 seen = getattr(self, "seen_reference_stamps", None)
@@ -1003,6 +1043,9 @@ class BidirectionalMotorTest(Node):
             self.get_logger().info(
                 "event %d %s: %.3f ms (%s, %s)" %
                 (result.event_id, result.metric, result.latency_ms,
+                 "ROS publish -> G10 UDP packet host receipt"
+                 if (self.g10_enabled and
+                     result.metric == "force_direction_change") else
                  "ROS publish -> estimated G10 sample (uncalibrated bias)"
                  if self.g10_enabled else
                  "ROS publish -> force ROS message receipt",
@@ -1068,7 +1111,9 @@ class BidirectionalMotorTest(Node):
         if mode != "SINE":
             if self.wave.running:
                 self.last_wave_stopped_ns = now
-                self._log_event("sine_stopped", mode=mode, now_ns=now)
+                self._log_event(
+                    "sine_stopped" if self.waveform_mode == "sine"
+                    else "step_stopped", mode=mode, now_ns=now)
             self.wave.stop()
             self.latency.cancel()
             self._publish(0, mode, 0.0, 0, 0.0)
@@ -1086,14 +1131,21 @@ class BidirectionalMotorTest(Node):
                 self._publish(0, "WAIT_FOR_STOPPED_RPM", 0.0, 0, 0.0)
                 return
             self.wave.start(now)
-            self._log_event("sine_started", mode=mode, now_ns=now)
+            self._log_event(
+                "sine_started" if self.waveform_mode == "sine"
+                else "step_started",
+                mode="SINE" if self.waveform_mode == "sine" else "STEP",
+                now_ns=now)
 
         wave = self.wave.step(now, rpm_ready=self._rpm_ready(now))
+        command_mode = ("SINE" if self.waveform_mode == "sine" else "STEP")
         send_ns = self._publish(
-            wave.dshot, mode, wave.sine, wave.direction, wave.phase_rad)
+            wave.dshot, command_mode, wave.sine, wave.direction,
+            wave.phase_rad)
 
         if wave.event:
-            self._log_event(wave.event, mode=mode, dshot=wave.dshot,
+            self._log_event(
+                wave.event, mode=command_mode, dshot=wave.dshot,
                             sine=wave.sine, now_ns=send_ns)
 
         if wave.event in ("first_command", "reversal_command"):
@@ -1111,7 +1163,8 @@ class BidirectionalMotorTest(Node):
                     self.get_logger().warn(
                         "G10 raw event buffer full for event %d" % event_id)
             self._log_event(
-                "force_response_reference", mode=mode, dshot=wave.dshot,
+                "force_response_reference", mode=command_mode,
+                dshot=wave.dshot,
                 sine=wave.sine, event_id=event_id, now_ns=send_ns,
                 direction=wave.direction,
                 reversal_from=(
